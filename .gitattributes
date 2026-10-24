@@ -1,0 +1,17 @@
+# Shell scripts MUST stay LF (they ship in deb/apk/AUR packages).
+* text=auto
+*.sh text eol=lf
+bash/visend text eol=lf
+packaging/visend-dispatch text eol=lf
+packaging/deb/control text eol=lf
+packaging/apk/APKBUILD text eol=lf
+packaging/aur/PKGBUILD text eol=lf
+packaging/aur/.SRCINFO text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
+*.png binary
