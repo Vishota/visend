@@ -1,0 +1,30 @@
+# Example self-hosted visend-server deployment.
+#
+#   mkdir secrets
+#   echo "123456:your-bot-token" > secrets/telegram_bot_token.txt
+#   head -c 32 /dev/urandom | base64 > secrets/server_secret.txt
+#   docker compose -f compose.example.yml up -d
+#
+# Then on your machine: visend server set https://your.host[:port] && visend setup
+
+services:
+  visend-server:
+    image: ghcr.io/vishota/visend-server:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Optional: restrict who may pair with this server (comma-separated ids).
+      # Without it any Telegram user who can message your bot may pair.
+      - ALLOWED_USER_IDS=
+      # Optional: lower the file size limit (bytes); default 50 MB like Telegram.
+      - MAX_FILE_SIZE=52428800
+    secrets:
+      - telegram_bot_token
+      - server_secret
+
+secrets:
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token.txt
+  server_secret:
+    file: ./secrets/server_secret.txt
