@@ -161,3 +161,55 @@ readme.md - описание для юзера (ru/en). Содержит:
 
 Для CLI (nodejs/bash/powershell) - любые зависимости запрещены.  
 Серверу разрешены: Express, jose
+
+## Релизы
+
+Версионирование - semver. Релиз = тег `vX.Y.Z`. Пуш тега запускает CI, который собирает и публикует всё сам.
+
+Всё, что требует отдельного от исходников билда, собирается в `releases/<tag>/` - каждый релиз в своей папке. В git не коммитим (.gitignore) - артефакты живут в GitHub Release, на gh-pages и в registry:
+
+    releases/v1.2.3/
+    ├── visend-1.2.3.tar.gz     # исходники (git archive) - источник для AUR и apk-сборки
+    ├── checksums.txt           # sha256 всего содержимого папки
+    ├── deb/visend_1.2.3_all.deb
+    ├── apk/visend-1.2.3-r0.apk
+    └── winget/                 # фаза 2
+
+### Каналы установки
+
+- npm: `nodejs/` публикуется как пакет `visend` → `npx visend` / `npm i -g visend`. version в package.jsсинхронизируем с тегом
+- apt (debian/ubuntu): свой статический репозиторий на gh-pages (`apt/`: pool + dists + подписанный InRelease). Пакет `all`, Depends: `nodejs (>= 16) | curl`
+- apk (alpine): свой статический репозиторий на gh-pages (`apk/`: подписанный APKINDEX.tar.gz; кладём в x86_64 и aarch64 - пакет noarch). depends: `curl`
+- pacman (arch): AUR-пакет `visend` - PKGBUILD качает tarball с GitHub Release, собирается у юзера. В официальные репы не лезем - долго и незачем, AUR достаточно
+- winget: фаза 2. winget требует exe → бандлим nodejs-версию с рантаймом (node SEA или pkg - чисто CI-инструмент, не зависимость) → portable zip в GitHub Release → PR в microsoft/winget-pkgs. Бонус: exe работает без установленного node. Если захочется закрыть windows побыстрее - scoop-манифест на тот же zip делается за минуты
+- docker: образ из `server/` → ghcr.io (`visend-server:<tag>` + `latest`), зеркало на Docker Hub - опционально
+
+deb/apk/AUR ставят обе nix-платформы (nodejs/ + bash/) и dispatcher `/usr/bin/visend`: node >= 16 если есть, иначе bash+curl. powershell-версия живёт только в windows-каналах (winget/scoop) - в nix-пакетах не нужна.
+
+Хост репозиториев - gh-pages: repo.visend.vishota.com через CNAME (fallback - <user>.github.io/visend). Публичные ключи и установочные команды для каждого канала - в README (ru/en).
+
+### Шаблоны упаковки
+
+Живут в `packaging/` в репо (это исходники, не билд):
+- `deb/control`, `apk/APKBUILD`, `aur/PKGBUILD` - с плейсхолдерами `__VERSION__` / `__SHA256__` (sha256 tarball'а), подставляются на CI
+- `winget/*.yaml` - манифесты (фаза 2)
+- `visend-dispatch` - шим выбора node/bash
+- `keys/` - публичные ключи (apt GPG, apk RSA), копируются на gh-pages
+
+### CI/CD
+
+`.github/workflows/release.yml`. Триггер - пуш тега `v*`; `workflow_dispatch` - dry-run: собираем всё, ничего не публикуем. Публикация - только на тег.
+
+Порядок job'ов:
+1. lint - синтаксис всех трёх платформ (node --check / bash -n / парсер pwsh)
+2. build - tarball, .deb, .apk → `releases/<tag>/` + checksums. deb - dpkg-deb, apk - в alpine-контейнере через abuild (подпись ключом из секретов)
+3. github-release - всё из `releases/<tag>/` в GitHub Release
+4. npm - publish `nodejs/`
+5. repos - gh-pages: apt-индексы (apt-ftparchive + GPG-подпись), apk-индексы (apk index + abuild-sign), публичные ключи. После github-release - tarball уже должен быть доступен по URL
+6. aur - PKGBUILD + .SRCINFO с подставленными версией и sha256, пуш в AUR ssh-ключом. Тоже после github-release
+7. docker - build & push образа сервера в ghcr
+
+Секреты CI (генерятся один раз локально): `NPM_TOKEN`, `AUR_SSH_KEY`, `APT_GPG_KEY`, `APK_SIGN_KEY` - приватные части; публичные - в `packaging/keys/` в репо.
+
+CI-инструменты (alpine-sdk, apt-ftparchive, pkg и т.д.) - обвязка билда, зависимостями CLI не считаются: CLI остаётся 0-dep.
+
