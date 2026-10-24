@@ -1,0 +1,14 @@
+#!/bin/sh
+# visend dispatcher (installed as /usr/bin/visend by deb/apk/AUR packages).
+# Prefers the nodejs implementation (needs node >= 16); falls back to the
+# bash+curl implementation otherwise.
+VISEND_LIB="${VISEND_LIB:-/usr/lib/visend}"
+
+if command -v node >/dev/null 2>&1; then
+    node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+    if [ "${node_major:-0}" -ge 16 ] 2>/dev/null; then
+        exec node "$VISEND_LIB/nodejs/bin/visend.js" "$@"
+    fi
+fi
+
+exec "$VISEND_LIB/bash/visend" "$@"

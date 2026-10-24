@@ -1,0 +1,30 @@
+# winget manifest template (phase 2).
+# Placeholders (__VERSION__, __SHA256__, __ZIPURL__) are substituted by CI.
+# Requires the portable zip produced by the node SEA/pkg bundling job and a
+# PR to microsoft/winget-pkgs.
+#
+# yamllint disable
+Id: Vishota.Visend.__VERSION__
+Version: __VERSION__
+PackageName: visend
+Publisher: Vishota
+License: MIT
+ShortDescription: Send files and text to yourself via Telegram from any terminal
+PackageUrl: https://github.com/Vishota/visend
+Moniker: visend
+Tags:
+  - telegram
+  - cli
+  - send
+  - files
+Installers:
+  - Architecture: x64
+    InstallerUrl: __ZIPURL__
+    InstallerType: zip
+    InstallerSha256: __SHA256__
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: visend.exe
+        PortableCommandAlias: visend
+ManifestType: singleton
+ManifestVersion: 1.6.0

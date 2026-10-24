@@ -1,0 +1,34 @@
+# Maintainer: Vishota <vishota@users.noreply.github.com>
+pkgname=visend
+pkgver=__VERSION__
+pkgrel=0
+pkgdesc="Send files and text to yourself via Telegram from any terminal"
+url="https://github.com/Vishota/visend"
+arch="noarch"
+license="MIT"
+depends="curl bash"
+subpackages=""
+source="visend-$pkgver.tar.gz"
+options="!check" # test suite lives in the repo, not in the release tarball
+sha256sums="__SHA256__"
+
+package() {
+	# bash implementation (always installed)
+	install -Dm755 "$srcdir"/visend-$pkgver/bash/visend \
+		"$pkgdir"/usr/lib/visend/bash/visend
+
+	# nodejs implementation (used automatically when node >= 16 is present)
+	for f in bin/visend.js \
+		lib/cli.js lib/config.js lib/httpx.js lib/errors.js lib/telegram.js \
+		lib/serverapi.js lib/tty.js lib/binary.js lib/send.js lib/stdin.js \
+		lib/commands/setup.js lib/commands/text.js lib/commands/file.js \
+		lib/commands/forget.js lib/commands/server.js lib/commands/settings.js \
+		lib/commands/help.js; do
+		install -Dm644 "$srcdir"/visend-$pkgver/nodejs/$f \
+			"$pkgdir"/usr/lib/visend/nodejs/$f
+	done
+
+	# dispatcher: node >= 16 when available, otherwise bash + curl
+	install -Dm755 "$srcdir"/visend-$pkgver/packaging/visend-dispatch \
+		"$pkgdir"/usr/bin/visend
+}

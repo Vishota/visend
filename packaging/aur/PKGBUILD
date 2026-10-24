@@ -1,0 +1,31 @@
+# Maintainer: Vishota <vishota@users.noreply.github.com>
+
+pkgname=visend
+pkgver=__VERSION__
+pkgrel=1
+pkgdesc="Send files and text to yourself via Telegram from any terminal"
+arch=('any')
+url="https://github.com/Vishota/visend"
+license=('MIT')
+depends=('bash' 'curl')
+optdepends=('nodejs>=16: nodejs implementation (preferred over bash)')
+source=("visend-$pkgver.tar.gz::https://github.com/Vishota/visend/releases/download/v$pkgver/visend-$pkgver.tar.gz")
+sha256sums=('__SHA256__')
+
+package() {
+    cd "$srcdir"
+
+    install -Dm755 visend-$pkgver/bash/visend "$pkgdir"/usr/lib/visend/bash/visend
+
+    for f in bin/visend.js \
+        lib/cli.js lib/config.js lib/httpx.js lib/errors.js lib/telegram.js \
+        lib/serverapi.js lib/tty.js lib/binary.js lib/send.js lib/stdin.js \
+        lib/commands/setup.js lib/commands/text.js lib/commands/file.js \
+        lib/commands/forget.js lib/commands/server.js lib/commands/settings.js \
+        lib/commands/help.js; do
+        install -Dm644 "visend-$pkgver/nodejs/$f" "$pkgdir/usr/lib/visend/nodejs/$f"
+    done
+
+    install -Dm755 visend-$pkgver/packaging/visend-dispatch "$pkgdir"/usr/bin/visend
+    install -Dm644 visend-$pkgver/LICENSE "$pkgdir"/usr/share/licenses/visend/LICENSE
+}

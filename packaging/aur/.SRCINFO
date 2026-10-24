@@ -1,0 +1,14 @@
+pkgbase = visend
+pkgdesc = Send files and text to yourself via Telegram from any terminal
+pkgver = __VERSION__
+pkgrel = 1
+url = https://github.com/Vishota/visend
+arch = any
+license = MIT
+depends = bash
+depends = curl
+optdepends = nodejs>=16: nodejs implementation (preferred over bash)
+source = visend-__VERSION__.tar.gz::https://github.com/Vishota/visend/releases/download/v__VERSION__/visend-__VERSION__.tar.gz
+sha256sums = __SHA256__
+
+pkgname = visend

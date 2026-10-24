@@ -1,0 +1,18 @@
+Package: visend
+Version: __VERSION__
+Section: utils
+Priority: optional
+Architecture: all
+Depends: nodejs (>= 16) | curl
+Maintainer: Vishota <vishota@users.noreply.github.com>
+Homepage: https://github.com/Vishota/visend
+Description: Send files and text to yourself via Telegram from any terminal
+ visend pipes stdin, arguments or files straight to your own Telegram chat:
+ .
+     ls | visend
+     visend file report.pdf
+ .
+ Works through your own bot (direct Bot API) or a shared visend server.
+ Ships two interchangeable implementations (nodejs and bash+curl); the
+ /usr/bin/visend dispatcher picks node when available (>= 16), otherwise
+ falls back to bash.

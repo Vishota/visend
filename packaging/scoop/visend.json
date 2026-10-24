@@ -1,0 +1,23 @@
+{
+  "version": "__VERSION__",
+  "description": "Send files and text to yourself via Telegram from any terminal",
+  "homepage": "https://github.com/Vishota/visend",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "__ZIPURL__",
+      "hash": "__SHA256__"
+    }
+  },
+  "bin": "visend.exe",
+  "checkver": {
+    "github": "https://github.com/Vishota/visend"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/Vishota/visend/releases/download/v$version/visend-$version-win-x64.zip"
+      }
+    }
+  }
+}
