@@ -10,7 +10,7 @@ The private parts live in GitHub Actions secrets and never enter this repo.
 
 Generate once, locally:
 
-    gpg --quick-generate-key "visend repo <vishota@users.noreply.github.com>" rsa3072 sign 0
+    gpg --quick-generate-key "visend repo <vishota@vishota.com>" rsa3072 sign 0
     gpg --armor --export <KEYID> > apt-repo-public.asc
 
 - public  -> commit `apt-repo-public.asc` here

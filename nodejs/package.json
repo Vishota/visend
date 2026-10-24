@@ -2,7 +2,10 @@
   "name": "visend",
   "version": "1.0.0",
   "description": "visend is a fast cross-platform tool way to send anything to telegram",
-  "author": "vishota",
+  "author": {
+    "name": "vishota",
+    "email": "vishota@vishota.com"
+  },
   "bin": {
     "visend": "bin/visend.js"
   },

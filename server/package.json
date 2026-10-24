@@ -2,7 +2,10 @@
   "name": "visend-server",
   "version": "1.0.0",
   "description": "visend is a fast cross-platform tool way to send anything to telegram - shared server component",
-  "author": "vishota",
+  "author": {
+    "name": "vishota",
+    "email": "vishota@vishota.com"
+  },
   "private": true,
   "main": "dist/index.js",
   "scripts": {
