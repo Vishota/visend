@@ -1,0 +1,15 @@
+# release artifacts live in GitHub Releases / gh-pages / registries, not in git
+releases/
+
+# node
+node_modules/
+dist/
+
+# tests
+tests/.tmp/
+tests/.tmp/**
+
+# local junk
+*.log
+.env
+.DS_Store
