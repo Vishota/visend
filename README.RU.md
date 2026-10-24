@@ -69,13 +69,13 @@ yay -S visend        # или любой AUR-хелпер
 - **scoop** (портабельный exe, node не нужен):
 
   ```powershell
-  scoop bucket add vishota https://github.com/Vishota/scoop-bucket
+  scoop bucket add vishota https://github.com/vishota/scoop-bucket
   scoop install visend
   ```
 
 - **winget** — в процессе (фаза 2, PR в `microsoft/winget-pkgs`).
 - Вручную: скачайте `visend-<version>-win-x64.zip` со страницы
-  [релизов](https://github.com/Vishota/visend/releases), распакуйте, добавьте в
+  [релизов](https://github.com/vishota/visend/releases), распакуйте, добавьте в
   `PATH`.
 - PowerShell без exe: скрипт `powershell/visend.ps1` из этого репозитория.
 

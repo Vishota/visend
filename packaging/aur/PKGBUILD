@@ -1,15 +1,15 @@
-# Maintainer: Vishota <vishota@users.noreply.github.com>
+# Maintainer: vishota <vishota@users.noreply.github.com>
 
 pkgname=visend
 pkgver=__VERSION__
 pkgrel=1
-pkgdesc="Send files and text to yourself via Telegram from any terminal"
+pkgdesc="visend is a fast cross-platform tool way to send anything to telegram"
 arch=('any')
-url="https://github.com/Vishota/visend"
+url="https://github.com/vishota/visend"
 license=('MIT')
 depends=('bash' 'curl')
 optdepends=('nodejs>=16: nodejs implementation (preferred over bash)')
-source=("visend-$pkgver.tar.gz::https://github.com/Vishota/visend/releases/download/v$pkgver/visend-$pkgver.tar.gz")
+source=("visend-$pkgver.tar.gz::https://github.com/vishota/visend/releases/download/v$pkgver/visend-$pkgver.tar.gz")
 sha256sums=('__SHA256__')
 
 package() {

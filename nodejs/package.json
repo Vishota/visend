@@ -1,7 +1,8 @@
 {
   "name": "visend",
   "version": "1.0.0",
-  "description": "Send files and text to yourself via Telegram, straight from your terminal",
+  "description": "visend is a fast cross-platform tool way to send anything to telegram",
+  "author": "vishota",
   "bin": {
     "visend": "bin/visend.js"
   },
@@ -15,12 +16,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Vishota/visend.git"
+    "url": "git+https://github.com/vishota/visend.git"
   },
   "bugs": {
-    "url": "https://github.com/Vishota/visend/issues"
+    "url": "https://github.com/vishota/visend/issues"
   },
-  "homepage": "https://github.com/Vishota/visend#readme",
+  "homepage": "https://github.com/vishota/visend#readme",
   "keywords": [
     "telegram",
     "cli",

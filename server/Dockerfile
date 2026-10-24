@@ -1,4 +1,7 @@
 # visend-server
+# visend is a fast cross-platform tool way to send anything to telegram.
+# Author: vishota - https://github.com/vishota/visend
+#
 # Multi-stage build: compile TS, ship a minimal runtime image.
 FROM node:24-alpine3.24 AS build
 WORKDIR /app
@@ -9,6 +12,12 @@ COPY src ./src
 RUN npm run build
 
 FROM node:24-alpine3.24
+LABEL org.opencontainers.image.title="visend-server" \
+      org.opencontainers.image.description="visend is a fast cross-platform tool way to send anything to telegram - shared server component" \
+      org.opencontainers.image.authors="vishota" \
+      org.opencontainers.image.url="https://github.com/vishota/visend#readme" \
+      org.opencontainers.image.source="https://github.com/vishota/visend" \
+      org.opencontainers.image.licenses="MIT"
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json* ./

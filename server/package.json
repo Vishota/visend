@@ -1,7 +1,8 @@
 {
   "name": "visend-server",
   "version": "1.0.0",
-  "description": "Proxy server for visend: relay text and files to Telegram via a shared bot",
+  "description": "visend is a fast cross-platform tool way to send anything to telegram - shared server component",
+  "author": "vishota",
   "private": true,
   "main": "dist/index.js",
   "scripts": {
@@ -14,6 +15,15 @@
     "node": ">=20"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vishota/visend.git",
+    "directory": "server"
+  },
+  "bugs": {
+    "url": "https://github.com/vishota/visend/issues"
+  },
+  "homepage": "https://github.com/vishota/visend#readme",
   "dependencies": {
     "express": "^4.21.2",
     "jose": "^5.9.6"

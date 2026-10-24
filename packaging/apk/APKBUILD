@@ -1,9 +1,9 @@
-# Maintainer: Vishota <vishota@users.noreply.github.com>
+# Maintainer: vishota <vishota@users.noreply.github.com>
 pkgname=visend
 pkgver=__VERSION__
 pkgrel=0
-pkgdesc="Send files and text to yourself via Telegram from any terminal"
-url="https://github.com/Vishota/visend"
+pkgdesc="visend is a fast cross-platform tool way to send anything to telegram"
+url="https://github.com/vishota/visend"
 arch="noarch"
 license="MIT"
 depends="curl bash"

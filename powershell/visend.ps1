@@ -1,4 +1,10 @@
 # visend - send files and text to yourself via Telegram.
+# visend is a fast cross-platform tool way to send anything to telegram.
+#
+# Author:  vishota
+# Repo:    https://github.com/vishota/visend
+# Docs:    https://github.com/vishota/visend#readme
+#
 # Pure Windows PowerShell 5.1+ implementation (no dependencies).
 # Shares the config file with the nodejs/bash implementations:
 #   ~\.config\visend\config.json

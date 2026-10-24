@@ -4,13 +4,13 @@
 # PR to microsoft/winget-pkgs.
 #
 # yamllint disable
-Id: Vishota.Visend.__VERSION__
+Id: vishota.visend.__VERSION__
 Version: __VERSION__
 PackageName: visend
-Publisher: Vishota
+Publisher: vishota
 License: MIT
-ShortDescription: Send files and text to yourself via Telegram from any terminal
-PackageUrl: https://github.com/Vishota/visend
+ShortDescription: visend is a fast cross-platform tool way to send anything to telegram
+PackageUrl: https://github.com/vishota/visend
 Moniker: visend
 Tags:
   - telegram

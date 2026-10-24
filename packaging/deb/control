@@ -4,10 +4,10 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: nodejs (>= 16) | curl
-Maintainer: Vishota <vishota@users.noreply.github.com>
-Homepage: https://github.com/Vishota/visend
-Description: Send files and text to yourself via Telegram from any terminal
- visend pipes stdin, arguments or files straight to your own Telegram chat:
+Maintainer: vishota <vishota@users.noreply.github.com>
+Homepage: https://github.com/vishota/visend
+Description: visend is a fast cross-platform tool way to send anything to telegram
+ Pipes stdin, arguments or files straight to your own Telegram chat:
  .
      ls | visend
      visend file report.pdf

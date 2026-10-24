@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
 # visend - send files and text to yourself via Telegram.
+# visend is a fast cross-platform tool way to send anything to telegram.
+#
+# Author:  vishota
+# Repo:    https://github.com/vishota/visend
+# Docs:    https://github.com/vishota/visend#readme
+#
 # Pure bash + curl implementation (zero dependencies beyond coreutils).
 # Shares the config file with the nodejs implementation:
 #   ~/.config/visend/config.json
