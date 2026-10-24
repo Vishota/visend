@@ -1,0 +1,364 @@
+name: release
+
+# Tag push (vX.Y.Z) = full build + publish everywhere.
+# workflow_dispatch = dry-run: build everything, publish nothing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # GitHub Releases + gh-pages push
+  packages: write   # ghcr.io docker push
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- lint ---
+  lint:
+    name: lint & test (node ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['10', '12', '16', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check (node --check / bash -n / dispatch)
+        run: |
+          find nodejs -name '*.js' -print0 | xargs -0 -n1 node --check
+          bash -n bash/visend
+          bash -n packaging/visend-dispatch
+      - name: CLI test suite (mock Telegram + mock server)
+        run: node tests/run.js
+      - name: Server typecheck + build (node 24 only)
+        if: matrix.node == '24'
+        working-directory: server
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+      - name: Server integration tests (node 24 only)
+        if: matrix.node == '24'
+        run: node tests/run-server.js
+      - name: Bash CLI e2e (node 24 only)
+        if: matrix.node == '24'
+        run: node tests/run-bash.js
+      - name: PowerShell parse check (node 24 only)
+        if: matrix.node == '24'
+        shell: pwsh
+        run: |
+          $errs = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            "$env:GITHUB_WORKSPACE/powershell/visend.ps1", [ref]$null, [ref]$errs)
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { $_.Message }; exit 1 }
+
+  # --------------------------------------------------------------- build ---
+  build:
+    name: build artifacts
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Resolve version (must match the tag on tag builds)
+        id: ver
+        run: |
+          PKG_VERSION=$(node -p "require('./nodejs/package.json').version")
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+              echo "nodejs/package.json version ($PKG_VERSION) does not match the tag ($TAG_VERSION)" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Tarball + .deb + checksums
+        run: |
+          VER='${{ steps.ver.outputs.version }}'
+          OUT="releases/v$VER"
+          mkdir -p "$OUT/deb"
+          git archive --format=tar.gz --prefix="visend-$VER/" -o "$OUT/visend-$VER.tar.gz" HEAD
+
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/lib/visend" "$STAGE/usr/bin" "$STAGE/usr/lib/visend/bash"
+          sed "s/__VERSION__/$VER/" packaging/deb/control > "$STAGE/DEBIAN/control"
+          cp -r nodejs/bin nodejs/lib "$STAGE/usr/lib/visend/nodejs/"
+          cp bash/visend "$STAGE/usr/lib/visend/bash/visend"
+          cp packaging/visend-dispatch "$STAGE/usr/bin/visend"
+          chmod 755 "$STAGE/usr/bin/visend" "$STAGE/usr/lib/visend/bash/visend" "$STAGE/usr/lib/visend/nodejs/bin/visend.js"
+          dpkg-deb --root-owner-group --build "$STAGE" "$OUT/deb/visend_${VER}_all.deb"
+
+          ( cd "$OUT" && find . -type f ! -name checksums.txt -print0 | sort -z | xargs -0 sha256sum > checksums.txt )
+
+      - name: Build .apk in alpine container (abuild, signed)
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          VER='${{ steps.ver.outputs.version }}'
+          OUT="$PWD/releases/v$VER"
+          mkdir -p "$OUT/apk"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -z "$APK_SIGN_KEY" ]; then
+            echo "APK_SIGN_KEY secret is missing (required on tag builds)" >&2
+            exit 1
+          fi
+          SHA=$(sha256sum "$OUT/visend-$VER.tar.gz" | cut -d' ' -f1)
+          WORK="$(mktemp -d)"
+          sed -e "s/__VERSION__/$VER/" -e "s/__SHA256__/$SHA/" packaging/apk/APKBUILD > "$WORK/APKBUILD"
+
+          docker run --rm \
+            -v "$WORK":/work -v "$OUT":/out \
+            -e APK_SIGN_KEY -e VER alpine:3.21 sh -euxc '
+              apk add --no-cache alpine-sdk sudo openssl
+              adduser -D builder && addgroup builder abuild
+              mkdir -p /home/builder/.abuild
+              if [ -n "${APK_SIGN_KEY:-}" ]; then
+                printf "%s" "$APK_SIGN_KEY" > /home/builder/.abuild/builder.rsa
+                openssl rsa -in /home/builder/.abuild/builder.rsa -pubout \
+                  > /home/builder/.abuild/builder.rsa.pub 2>/dev/null
+                # apk expects PEM without the "RSA PUBLIC KEY" legacy wrapper - pubout output is fine
+              else
+                # dry-run: throwaway key so the pipeline stays testable
+                su builder -c "abuild-keygen -a -n" >/dev/null
+              fi
+              chown -R builder /home/builder /work
+              cd /work
+              cp "/out/visend-$VER.tar.gz" .
+              su builder -c "abuild -r" >/dev/null
+              find /home/builder/packages -name "visend-$VER-r0.apk" -exec cp {} /out/apk/ \;
+              cp /home/builder/.abuild/*.rsa.pub /out/apk/
+            '
+          test -f "$OUT/apk/visend-$VER-r0.apk" || { echo "apk build failed"; exit 1; }
+          # noarch: the same .apk serves x86_64 and aarch64 repos
+
+          ( cd "$OUT" && find . -type f ! -name checksums.txt -print0 | sort -z | xargs -0 sha256sum > checksums.txt )
+
+      - name: Show artifacts
+        run: find releases -type f -exec ls -la {} \; -exec sha256sum {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-v${{ steps.ver.outputs.version }}
+          path: releases/
+          if-no-files-found: error
+
+  # ------------------------------------------------------ github-release ---
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-v${{ github.ref_name }}   # tag vX.Y.Z -> artifact release-vX.Y.Z
+          path: .
+      - name: Create GitHub Release with all artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          test -d "releases/v$VER" || { echo "release files missing"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$REPO" \
+            --title "visend v$VER" \
+            --generate-notes \
+            "releases/v$VER"/*
+
+  # ----------------------------------------------------------------- npm ---
+  npm:
+    name: npm publish
+    runs-on: ubuntu-24.04
+    needs: lint
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Verify version matches the tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./nodejs/package.json').version")
+          [ "$VER" = "$PKG" ] || { echo "version mismatch: tag=$VER pkg=$PKG"; exit 1; }
+      - name: Package README from the repo root
+        run: cp README.md nodejs/README.md
+      - name: Publish
+        working-directory: nodejs
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # --------------------------------------------------------------- repos ---
+  repos:
+    name: apt + apk repositories (gh-pages)
+    runs-on: ubuntu-24.04
+    needs: github-release
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Locate release files
+        id: rel
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          REL_DIR=$(find artifacts -type d -path "*releases/v$VER" | head -1)
+          [ -n "$REL_DIR" ] || { echo "release dir not found"; find artifacts -maxdepth 4 -type d; exit 1; }
+          echo "dir=$REL_DIR" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+      - name: Prepare gh-pages branch
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          if git fetch origin gh-pages; then
+            git checkout -B gh-pages origin/gh-pages
+            # wipe previous repo content, keep history
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          else
+            git checkout --orphan gh-pages
+            git rm -rf --ignore-unmatch . 2>/dev/null || true
+          fi
+      - name: Assemble + sign apt repository
+        env:
+          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
+        run: |
+          REL='${{ steps.rel.outputs.dir }}'
+          VER='${{ steps.rel.outputs.ver }}'
+          if [ -z "$APT_GPG_KEY" ]; then echo "APT_GPG_KEY secret missing"; exit 1; fi
+          mkdir -p "$HOME/.gnupg"; chmod 700 "$HOME/.gnupg"
+          printf '%s' "$APT_GPG_KEY" | gpg --batch --import
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')
+          [ -n "$KEYID" ] || { echo "could not import APT signing key"; exit 1; }
+
+          mkdir -p apt/pool/main/v/visend dists/stable/main/binary-amd64
+          cp "$REL/deb/visend_${VER}_all.deb" apt/pool/main/v/visend/
+          apt-ftparchive packages apt/pool > dists/stable/main/binary-amd64/Packages
+          gzip -kf dists/stable/main/binary-amd64/Packages
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=visend \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures="amd64 all" \
+            -o APT::FTPArchive::Release::Components=main \
+            release dists/stable > dists/stable/Release
+          gpg --batch --yes --armor --local-user "$KEYID" --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes --armor --local-user "$KEYID" --detach-sign -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --armor --export "$KEYID" > apt-repo-public.asc
+      - name: Assemble + sign apk repository
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          REL='${{ steps.rel.outputs.dir }}'
+          VER='${{ steps.rel.outputs.ver }}'
+          if [ -z "$APK_SIGN_KEY" ]; then echo "APK_SIGN_KEY secret missing"; exit 1; fi
+          printf '%s' "$APK_SIGN_KEY" > /tmp/apk-private.rsa
+          openssl rsa -in /tmp/apk-private.rsa -pubout -out /tmp/apk-public.rsa.pub 2>/dev/null
+          rm -f /tmp/apk-private.rsa
+          mkdir -p apk/x86_64 apk/aarch64
+          # noarch package: identical .apk in both arch dirs
+          cp "$REL"/apk/visend-*.apk apk/x86_64/
+          cp "$REL"/apk/visend-*.apk apk/aarch64/
+          docker run --rm -v "$PWD":/work \
+            -v /tmp/apk-private.rsa:/root/.abuild/builder.rsa:ro \
+            -e VER alpine:3.21 sh -euexc '
+              apk add --no-cache alpine-sdk openssl
+              openssl rsa -in /root/.abuild/builder.rsa -pubout > /root/.abuild/builder.rsa.pub 2>/dev/null
+              cd /work
+              for arch in x86_64 aarch64; do
+                apk index --allow-untrusted -o "$arch/APKINDEX.tar.gz" "$arch"/*.apk
+                abuild-sign -k /root/.abuild/builder.rsa "$arch/APKINDEX.tar.gz"
+              done
+            '
+          cp /tmp/apk-public.rsa.pub apk/visend-repo.rsa.pub
+      - name: Publish gh-pages (CNAME + keys)
+        run: |
+          echo "repo.visend.vishota.com" > CNAME
+          mkdir -p keys
+          cp packaging/keys/* keys/ 2>/dev/null || true
+          cp apt-repo-public.asc keys/ 2>/dev/null || true
+          cp apk/visend-repo.rsa.pub keys/ 2>/dev/null || true
+          git add -A
+          git commit -m "repo: publish ${GITHUB_REF_NAME}" || echo "nothing to commit"
+          git push origin gh-pages
+
+  # ----------------------------------------------------------------- aur ---
+  aur:
+    name: AUR publish
+    runs-on: ubuntu-24.04
+    needs: github-release
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fill PKGBUILD + .SRCINFO from the GitHub Release tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p aur && chmod 700 aur
+          curl -fsSL -o /tmp/visend.tar.gz \
+            "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/visend-$VER.tar.gz"
+          SHA=$(sha256sum /tmp/visend.tar.gz | cut -d' ' -f1)
+          sed -e "s/__VERSION__/$VER/g" -e "s/__SHA256__/$SHA/" packaging/aur/PKGBUILD > aur/PKGBUILD
+          sed -e "s/__VERSION__/$VER/g" -e "s/__SHA256__/$SHA/" packaging/aur/.SRCINFO > aur/.SRCINFO
+      - name: Push to AUR over ssh
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          [ -n "$AUR_SSH_KEY" ] || { echo "AUR_SSH_KEY secret missing"; exit 1; }
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_KEY" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKT6p7W6EcQoDLtdMTZywzfhIipmv3LrxwGGE2x9A4l" \
+            > "$HOME/.ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
+          git config user.name "Vishota"
+          git config user.email "vishota@users.noreply.github.com"
+          if git clone "ssh://aur@aur.archlinux.org/visend.git" aurrepo; then
+            cp aur/PKGBUILD aur/.SRCINFO aurrepo/
+            cd aurrepo
+          else
+            cd aur
+            git init -b master
+            git remote add origin "ssh://aur@aur.archlinux.org/visend.git"
+          fi
+          git add -A
+          git commit -m "visend ${GITHUB_REF_NAME#v}" || echo "nothing to commit"
+          git push origin master
+
+  # -------------------------------------------------------------- docker ---
+  docker:
+    name: docker image (ghcr)
+    runs-on: ubuntu-24.04
+    needs: lint
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/visend-server:latest
+            ghcr.io/${{ github.repository_owner }}/visend-server:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
