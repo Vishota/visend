@@ -1,0 +1,942 @@
+#!/usr/bin/env bash
+#
+# visend - send files and text to yourself via Telegram.
+# Pure bash + curl implementation (zero dependencies beyond coreutils).
+# Shares the config file with the nodejs implementation:
+#   ~/.config/visend/config.json
+#
+set -u
+
+VISEND_VERSION="1.0.0"
+DEFAULT_SERVER_URL="https://visend.vishota.com"
+TELEGRAM_TEXT_LIMIT=4096
+TELEGRAM_FILE_LIMIT=$((50 * 1024 * 1024))
+
+CONFIG_DIR="${HOME:-$(cd ~ && pwd)}/.config/visend"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+TG_API="${VISEND_TELEGRAM_API_BASE:-https://api.telegram.org}"
+
+ASSUME_YES=0
+FORCE_AS_TEXT=0
+OPT_NAME=""
+TMPFILES=""
+
+cleanup() {
+  local f
+  for f in $TMPFILES; do rm -f "$f" 2>/dev/null; done
+}
+trap cleanup EXIT
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "Warning: $*"
+}
+
+out() {
+  echo "$*"
+}
+
+new_tmp() {
+  local f
+  f=$(mktemp "${TMPDIR:-/tmp}/visend.XXXXXX") || die "cannot create a temp file"
+  TMPFILES="$TMPFILES $f"
+  printf '%s' "$f"
+}
+
+# ---------------------------------------------------------------- config ---
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# config_get KEY [default] - reads a string field
+config_get() {
+  local key="$1" default="${2:-}" value=""
+  if [ -f "$CONFIG_FILE" ]; then
+    value=$(sed -n "s/.*\"$key\":[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CONFIG_FILE" | head -n 1)
+  fi
+  printf '%s' "${value:-$default}"
+}
+
+config_get_number() {
+  local key="$1" default="${2:-}" value=""
+  if [ -f "$CONFIG_FILE" ]; then
+    value=$(sed -n "s/.*\"$key\":[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$CONFIG_FILE" | head -n 1)
+  fi
+  printf '%s' "${value:-$default}"
+}
+
+MODE="$(config_get mode)"
+BOT_TOKEN="$(config_get bot_token)"
+USER_ID="$(config_get_number user_id)"
+SERVER_URL="$(config_get server_url)"
+SERVER_TOKEN="$(config_get server_token)"
+SERVER_URL="${SERVER_URL:-$DEFAULT_SERVER_URL}"
+
+save_config() {
+  # Rebuilds the whole file from MODE/BOT_TOKEN/USER_ID/SERVER_URL/SERVER_TOKEN.
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || die "cannot create $CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR" 2>/dev/null
+  local tmp entries=0
+  tmp=$(new_tmp)
+  {
+    printf '{'
+    if [ -n "$MODE" ]; then
+      printf '\n  "mode": "%s"' "$(json_escape "$MODE")"; entries=1
+    fi
+    if [ -n "$BOT_TOKEN" ]; then
+      [ $entries -eq 1 ] && printf ','
+      printf '\n  "bot_token": "%s"' "$(json_escape "$BOT_TOKEN")"; entries=1
+    fi
+    if [ -n "$USER_ID" ]; then
+      [ $entries -eq 1 ] && printf ','
+      printf '\n  "user_id": %s' "$USER_ID"; entries=1
+    fi
+    if [ -n "$SERVER_URL" ] && [ "$SERVER_URL" != "$DEFAULT_SERVER_URL" ]; then
+      [ $entries -eq 1 ] && printf ','
+      printf '\n  "server_url": "%s"' "$(json_escape "$SERVER_URL")"; entries=1
+    fi
+    if [ -n "$SERVER_TOKEN" ]; then
+      [ $entries -eq 1 ] && printf ','
+      printf '\n  "server_token": "%s"' "$(json_escape "$SERVER_TOKEN")"; entries=1
+    fi
+    if [ $entries -eq 1 ]; then printf '\n'; fi
+    printf '}\n'
+  } > "$tmp"
+  chmod 600 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$CONFIG_FILE"
+}
+
+require_setup() {
+  if [ "$MODE" = "bot" ] && [ -n "$BOT_TOKEN" ] && [ -n "$USER_ID" ]; then return 0; fi
+  if [ "$MODE" = "server" ] && [ -n "$USER_ID" ]; then
+    if [ -z "$SERVER_TOKEN" ]; then
+      die "The server token is missing (the server URL was changed after setup). Run \`visend setup\` again to get a new one-time code."
+    fi
+    return 0
+  fi
+  die "visend is not configured yet. Run \`visend setup\` first."
+}
+
+# ------------------------------------------------------------------ tty ---
+
+tty_open() {
+  # Duplicates /dev/tty onto fd 3 for prompts; stdin may carry piped data.
+  if [ ! -e /dev/tty ]; then
+    die "This prompt needs an interactive terminal. Re-run from a console, or pass -y / --yes to auto-confirm."
+  fi
+  if ! exec 3<>/dev/tty 2>/dev/null; then
+    die "This prompt needs an interactive terminal. Re-run from a console, or pass -y / --yes to auto-confirm."
+  fi
+}
+
+confirm() {
+  local question="$1" reply=""
+  [ "$ASSUME_YES" = 1 ] && return 0
+  tty_open
+  printf '%s [y/N] ' "$question" >&3
+  read -r reply <&3 || reply=""
+  echo >&3
+  case "$reply" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prompt_var() {
+  # prompt_var VARNAME "Question: "
+  local var="$1" question="$2" reply=""
+  tty_open
+  printf '%s' "$question" >&3
+  read -r reply <&3 || reply=""
+  printf -v "$var" '%s' "$reply"
+}
+
+prompt_required() {
+  local var="$1" question="$2"
+  while :; do
+    prompt_var "$var" "$question"
+    if [ -n "${!var}" ]; then return 0; fi
+    echo "Value is required." >&3
+  done
+}
+
+ask_user_id() {
+  # ask_user_id VAR "Question: "
+  local var="$1" question="$2"
+  while :; do
+    prompt_var "$var" "$question"
+    if printf '%s' "${!var}" | grep -Eq '^[0-9]{1,16}$'; then return 0; fi
+    echo "User id must be a number (yours from @userinfobot)." >&3
+  done
+}
+
+# ------------------------------------------------------------------ net ---
+
+urlencode() {
+  local s="$1" out="" c i hex
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:$i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+native_path() {
+  # Native Windows curl cannot read MSYS paths (/tmp/...); cygpath converts
+  # them. No-op on Linux (cygpath does not exist there).
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+tg_call() {
+  # tg_call METHOD [curl-data-args...]
+  local method="$1"; shift
+  curl -sS -m 60 -X POST "$TG_API/bot$BOT_TOKEN/$method" "$@"
+}
+
+tg_ok() {
+  printf '%s' "$1" | grep -q '"ok":true'
+}
+
+tg_description() {
+  printf '%s' "$1" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p'
+}
+
+tg_message_id() {
+  printf '%s' "$1" | sed -n 's/.*"message_id":\([0-9]*\).*/\1/p' | head -n 1
+}
+
+tg_error_code() {
+  printf '%s' "$1" | sed -n 's/.*"error_code":\([0-9]*\).*/\1/p' | head -n 1
+}
+
+send_text_bot() {
+  # $1 = file with the text
+  local resp desc np
+  np=$(native_path "$1")
+  resp=$(tg_call sendMessage \
+    --data-urlencode "chat_id=$USER_ID" \
+    --data-urlencode "text@$np") || die "Telegram API request failed (network error)."
+  if tg_ok "$resp"; then
+    out "Text sent to Telegram (message_id $(tg_message_id "$resp"))."
+  else
+    desc=$(tg_description "$resp")
+    [ -z "$desc" ] && desc="unknown error"
+    die "Telegram API error: $desc (code $(tg_error_code "$resp"))."
+  fi
+}
+
+send_file_bot() {
+  # $1 = file path, $2 = display name, $3 = size (for messages)
+  local resp desc np
+  np=$(native_path "$1")
+  resp=$(tg_call sendDocument \
+    -F "chat_id=$USER_ID" \
+    -F "document=@$np;filename=$2") || die "Telegram API request failed (network error)."
+  if tg_ok "$resp"; then
+    out "File \"$2\" ($(size_mb "$3") MB) sent to Telegram."
+  else
+    desc=$(tg_description "$resp")
+    [ -z "$desc" ] && desc="unknown error"
+    die "Telegram API error: $desc (code $(tg_error_code "$resp"))."
+  fi
+}
+
+server_post_text() {
+  # $1 = file with the text
+  local resp desc np
+  np=$(native_path "$1")
+  resp=$(curl -sS -m 120 -X POST "$SERVER_URL/text" \
+    -H "Authorization: Bearer $SERVER_TOKEN" \
+    -H "Content-Type: text/plain; charset=utf-8" \
+    --data-binary "@$np") || die "Server request failed (network error)."
+  if tg_ok "$resp"; then
+    out "Text sent to Telegram via $SERVER_URL (message_id $(tg_message_id "$resp"))."
+  else
+    desc=$(tg_description "$resp"); [ -z "$desc" ] && desc=$(server_error "$resp")
+    die "Sending text failed: ${desc:-HTTP error}."
+  fi
+}
+
+server_post_file() {
+  # $1 = file path, $2 = display name, $3 = size in bytes
+  local resp desc np
+  np=$(native_path "$1")
+  resp=$(curl -sS -m 300 -X POST "$SERVER_URL/file?name=$(urlencode "$2")" \
+    -H "Authorization: Bearer $SERVER_TOKEN" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@$np") || die "Server request failed (network error)."
+  if tg_ok "$resp"; then
+    out "File \"$2\" ($(size_mb "$3") MB) sent to Telegram via $SERVER_URL."
+    return 0
+  fi
+  if printf '%s' "$resp" | grep -q '"file_too_large"'; then
+    local limit
+    limit=$(printf '%s' "$resp" | sed -n 's/.*"max_file_size":\([0-9]*\).*/\1/p')
+    die "The server rejected the file: its own size limit is $((limit / 1024 / 1024)) MB (this is a server-side limit, not the Telegram one)."
+  fi
+  if printf '%s' "$resp" | grep -q '"unauthorized"' || printf '%s' "$resp" | grep -q '"error":"unauthorized"'; then
+    die "The server rejected the token. Run \`visend setup\` again to get a new one-time code."
+  fi
+  desc=$(tg_description "$resp")
+  die "Sending file failed: ${desc:-HTTP error}."
+}
+
+server_error() {
+  printf '%s' "$1" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p'
+}
+
+size_mb() {
+  awk -v b="$1" 'BEGIN { printf "%.1f", b / 1048576 }'
+}
+
+file_size() {
+  local f="$1"
+  if stat -c%s "$f" >/dev/null 2>&1; then stat -c%s "$f"
+  else wc -c < "$f" | tr -d ' '
+  fi
+}
+
+send_text() {
+  require_setup
+  if [ "$MODE" = "bot" ]; then send_text_bot "$1"; else server_post_text "$1"; fi
+}
+
+send_file() {
+  # $1 file, $2 name, $3 size
+  require_setup
+  if [ "$MODE" = "bot" ]; then send_file_bot "$1" "$2" "$3"; else server_post_file "$1" "$2" "$3"; fi
+}
+
+# --------------------------------------------------------------- content ---
+
+detect_binary() {
+  # $1 = file; sets BIN_REASON, returns 0 when binary
+  if head -c 8192 "$1" 2>/dev/null | od -An -tx1 | grep -q ' 00 '; then
+    BIN_REASON="contains NUL bytes"
+    return 0
+  fi
+  if command -v iconv >/dev/null 2>&1; then
+    if ! iconv -f UTF-8 -t UTF-8 "$1" >/dev/null 2>&1; then
+      BIN_REASON="is not valid UTF-8"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+preview() {
+  head -c 64 "$1" | cat -v | tr -d '\n'
+  echo "..."
+}
+
+count_chars() {
+  # $1 = file; chars (not bytes) when iconv is available
+  local bytes
+  bytes=$(wc -c < "$1" | tr -d ' ')
+  if command -v iconv >/dev/null 2>&1; then
+    local chars
+    chars=$(iconv -f UTF-8 -t UTF-32LE < "$1" 2>/dev/null | wc -c | tr -d ' ')
+    if [ -n "$chars" ] && [ "$chars" -gt 0 ] 2>/dev/null; then
+      printf '%s' $((chars / 4))
+      return
+    fi
+  fi
+  printf '%s' "$bytes"
+}
+
+truncate_chars() {
+  # truncate_chars IN OUT LIMIT - UTF-8 safe via UTF-32 roundtrip
+  local in="$1" out="$2" limit="$3"
+  if command -v iconv >/dev/null 2>&1; then
+    if iconv -f UTF-8 -t UTF-32LE < "$in" 2>/dev/null | head -c $((limit * 4)) | iconv -f UTF-32LE -t UTF-8 > "$out" 2>/dev/null; then
+      return
+    fi
+  fi
+  head -c "$limit" "$in" > "$out"
+}
+
+# -------------------------------------------------------------- commands ---
+
+cmd_help() {
+  cat <<'EOF'
+visend - send files and text to yourself via Telegram
+
+Usage:
+  visend                                 same as `visend text` when stdin is piped,
+                                         otherwise shows this help
+  visend text [text...] [--force-as-text]
+                                         send text; multiple arguments are joined with
+                                         spaces; piped stdin is sent as the text
+  visend file [path] [--name <name>]     send a file; with piped stdin sends it as a
+                                         file named visend.txt (or --name)
+  visend setup                           pair visend with your Telegram (own bot or
+                                         shared server)
+  visend settings                        show current settings
+  visend forget [-y|--yes]               delete all settings except the server URL
+  visend server                          show server URL, status and bot link
+  visend server set <url> [-y|--yes]     switch to another visend server
+  visend server reset [-y|--yes]         switch back to the default server
+  visend help                            show this help
+
+Options:
+  -y, --yes           answer "yes" to all confirmation prompts
+  --name <name>       file name to use for `visend file`
+  --force-as-text     send text longer than 4096 chars as text anyway (it will be cut
+                      to the Telegram limit)
+  -h, --help          show this help
+
+Flags go after positional arguments: `visend text hello --force-as-text`.
+
+Examples:
+  ls | visend
+  cat log.txt | visend text
+  visend text hello world
+  visend file report.pdf
+  cat data.csv | visend file --name data.csv
+
+Docs: https://github.com/Vishota/visend
+EOF
+}
+
+stdin_piped() {
+  [ ! -t 0 ]
+}
+
+read_stdin_to() {
+  cat > "$1" || die "failed to read stdin"
+  if [ ! -s "$1" ]; then
+    die "Nothing to send - stdin is empty. Pipe something in (\`cat notes.txt | visend text\`) or pass the text as an argument (\`visend text hello world\`)."
+  fi
+}
+
+cmd_text() {
+  local text_arg="$1" tmp chars detected
+  tmp=$(new_tmp)
+  if [ -n "$text_arg" ] && stdin_piped; then
+    warn "stdin ignored - the text argument takes priority."
+  fi
+  if [ -n "$text_arg" ]; then
+    printf '%s' "$text_arg" > "$tmp"
+  elif stdin_piped; then
+    read_stdin_to "$tmp"
+  else
+    die "Nothing to send. Pipe something in (\`cat notes.txt | visend text\`) or pass the text as an argument (\`visend text hello world\`)."
+  fi
+
+  # Binary check runs before the length check.
+  if detect_binary "$tmp"; then
+    warn "the input looks like binary data ($BIN_REASON)."
+    out "First bytes: $(preview "$tmp")"
+    if ! confirm "Send it as text anyway?"; then
+      die "Aborted. Use \`visend file\` to send binary data as a file."
+    fi
+  fi
+
+  chars=$(count_chars "$tmp")
+  if [ "$FORCE_AS_TEXT" = 1 ]; then
+    if [ "$chars" -gt "$TELEGRAM_TEXT_LIMIT" ]; then
+      warn "the input is $chars characters; Telegram cuts messages at $TELEGRAM_TEXT_LIMIT characters. Sending the first $TELEGRAM_TEXT_LIMIT (--force-as-text)."
+      truncate_chars "$tmp" "$tmp.trunc" "$TELEGRAM_TEXT_LIMIT"
+      mv -f "$tmp.trunc" "$tmp"
+      TMPFILES="$TMPFILES $tmp.trunc"
+    fi
+    send_text "$tmp"
+    return
+  fi
+
+  if [ "$chars" -gt "$TELEGRAM_TEXT_LIMIT" ]; then
+    warn "the input is $chars characters, but Telegram messages are capped at $TELEGRAM_TEXT_LIMIT characters. Sending it as a file \"visend.txt\" instead. Use --force-as-text to send it as text anyway (it will be cut)."
+    local size
+    size=$(file_size "$tmp")
+    if [ "$size" -gt "$TELEGRAM_FILE_LIMIT" ]; then
+      die "The file is $(size_mb "$size") MB, but Telegram bots can only send files up to 50 MB."
+    fi
+    send_file "$tmp" "visend.txt" "$size"
+    return
+  fi
+
+  send_text "$tmp"
+}
+
+cmd_file() {
+  local path_arg="$1" tmp name size
+  if [ -n "$path_arg" ] && stdin_piped; then
+    warn "stdin ignored - the file path takes priority."
+  fi
+  if [ -n "$path_arg" ]; then
+    [ -f "$path_arg" ] || die "Cannot read \"$path_arg\": no such file."
+    [ -d "$path_arg" ] && die "\"$path_arg\" is a directory. Pass a file path."
+    size=$(file_size "$path_arg")
+    name="${OPT_NAME:-$(basename "$path_arg")}"
+  elif stdin_piped; then
+    tmp=$(new_tmp)
+    read_stdin_to "$tmp"
+    size=$(file_size "$tmp")
+    name="${OPT_NAME:-visend.txt}"
+  else
+    die "Nothing to send. Pipe something in (\`cat report.pdf | visend file\`) or pass a file path (\`visend file report.pdf\`)."
+  fi
+
+  if [ "$size" -gt "$TELEGRAM_FILE_LIMIT" ]; then
+    die "The file is $(size_mb "$size") MB, but Telegram bots can only send files up to 50 MB."
+  fi
+
+  if [ -n "$path_arg" ]; then
+    send_file "$path_arg" "$name" "$size"
+  else
+    send_file "$tmp" "$name" "$size"
+  fi
+}
+
+cmd_settings() {
+  local token_preview
+  out "Settings file: $CONFIG_FILE"
+  if [ "$MODE" = "bot" ]; then out "Mode:          own bot (direct Telegram API)"
+  elif [ "$MODE" = "server" ]; then out "Mode:          shared server"
+  else out "Mode:          not configured (run \`visend setup\`)"; fi
+  out "User id:       ${USER_ID:-not set}"
+  if [ "$SERVER_URL" = "$DEFAULT_SERVER_URL" ]; then
+    out "Server URL:    $SERVER_URL (default)"
+  else
+    out "Server URL:    $SERVER_URL"
+  fi
+  if [ -n "$BOT_TOKEN" ]; then
+    token_preview="${BOT_TOKEN:0:4}...${BOT_TOKEN: -4}"
+    out "Bot token:     $token_preview"
+  else
+    out "Bot token:     not set"
+  fi
+  if [ -n "$SERVER_TOKEN" ]; then
+    token_preview="${SERVER_TOKEN:0:4}...${SERVER_TOKEN: -4}"
+    out "Server token:  $token_preview"
+  else
+    out "Server token:  not set"
+  fi
+}
+
+cmd_forget() {
+  if [ -z "$MODE" ] && [ -z "$BOT_TOKEN" ] && [ -z "$SERVER_TOKEN" ] && [ -z "$USER_ID" ]; then
+    out "Nothing to forget - visend is not configured."
+    return 0
+  fi
+  if ! confirm "Delete all visend settings (bot token, server token, user id)? The server URL is kept."; then
+    die "Aborted."
+  fi
+  # Everything except the server URL.
+  MODE=""; BOT_TOKEN=""; SERVER_TOKEN=""; USER_ID=""
+  save_config
+  out "Settings removed ($CONFIG_FILE). Run \`visend setup\` to start over."
+}
+
+server_status() {
+  curl -sS -m 10 "$SERVER_URL/status" 2>/dev/null
+}
+
+server_config() {
+  curl -sS -m 10 "$SERVER_URL/config" 2>/dev/null
+}
+
+humanize_uptime() {
+  awk -v s="$1" 'BEGIN {
+    h = int(s / 3600); m = int((s % 3600) / 60)
+    if (h) printf "%dh %dm", h, m
+    else if (m) printf "%dm %ds", m, s % 60
+    else printf "%ds", s
+  }'
+}
+
+cmd_server_show() {
+  local status cfg uptime bot
+  out "Server: $SERVER_URL"
+  status=$(server_status)
+  if tg_ok "$status"; then
+    uptime=$(printf '%s' "$status" | sed -n 's/.*"uptime_seconds":\([0-9]*\).*/\1/p')
+    out "Status: online (uptime $(humanize_uptime "${uptime:-0}"))"
+  else
+    out "Status: unreachable - the server did not respond."
+    out ""
+    out "You can host your own visend server from the official docker image and point"
+    out "visend at it with \`visend server set <url>\` - see the README (Self-hosting)."
+    return 0
+  fi
+  cfg=$(server_config)
+  bot=$(printf '%s' "$cfg" | sed -n 's/.*"bot":"\([^"]*\)".*/\1/p')
+  if [ -n "$bot" ]; then
+    out "Bot: $bot (send /start to it to get your user id and a code)"
+  else
+    out "Bot: unknown (could not fetch server config)."
+  fi
+}
+
+apply_server_url() {
+  # $1 = new url; wipes SERVER_TOKEN in server mode
+  local new_url="$1"
+  if [ "$new_url" = "$SERVER_URL" ]; then
+    out "Server URL is already $new_url - nothing to change."
+    return 0
+  fi
+  SERVER_URL="$new_url"
+  if [ "$MODE" = "server" ] && [ -n "$SERVER_TOKEN" ]; then
+    SERVER_TOKEN=""
+    save_config
+    out "Server URL saved."
+    out ""
+    out "Note: for security the old server token has been removed - the new server will"
+    out "not accept it. Run \`visend setup\` again and enter a new one-time code."
+    return 0
+  fi
+  save_config
+  out "Server URL saved."
+}
+
+cmd_server_set() {
+  local url="$1" status
+  case "$url" in
+    http://*|https://*) : ;;
+    *) die "Invalid URL \"$url\": it must start with http:// or https://" ;;
+  esac
+  url="${url%/}"
+  case "$url" in
+    http://*)
+      warn "this URL uses plain http:// - your pairing code, token and data will"
+      warn "travel over the network unencrypted."
+      if ! confirm "Continue anyway?"; then die "Aborted."; fi
+      ;;
+  esac
+  out "Checking $url ..."
+  status=$(curl -sS -m 10 "$url/status" 2>/dev/null)
+  if tg_ok "$status"; then
+    out "Server is up."
+  else
+    warn "the server did not respond."
+    if ! confirm "Save this URL anyway?"; then die "Aborted."; fi
+  fi
+  apply_server_url "$url"
+}
+
+cmd_server_reset() {
+  local status
+  out "Reset the server URL to $DEFAULT_SERVER_URL?"
+  if ! confirm "Continue?"; then die "Aborted."; fi
+  out "Checking $DEFAULT_SERVER_URL ..."
+  status=$(curl -sS -m 10 "$DEFAULT_SERVER_URL/status" 2>/dev/null)
+  if ! tg_ok "$status"; then
+    warn "the default server did not respond."
+    if ! confirm "Reset anyway?"; then die "Aborted."; fi
+  fi
+  if [ "$SERVER_URL" = "$DEFAULT_SERVER_URL" ] && ! grep -q '"server_url"' "$CONFIG_FILE" 2>/dev/null; then
+    out "The server URL is already the default."
+    return 0
+  fi
+  apply_server_url "$DEFAULT_SERVER_URL"
+}
+
+# ---------------------------------------------------------------- setup ---
+
+server_setup() {
+  local bot_link user_id code resp token welcome payload
+  out ""
+  out "Warning: with the shared server your text, files and pairing codes pass through"
+  out "a third-party server before reaching Telegram. Treat it as a dev tool - do not use"
+  out "it for sensitive data. For full control you can host your own server from the"
+  out "official docker image - see \`visend server\` and the README."
+  out ""
+  bot_link=$(printf '%s' "$SERVER_CFG_CACHE" | sed -n 's/.*"bot":"\([^"]*\)".*/\1/p')
+  if [ -n "$bot_link" ]; then
+    out "1. Open $bot_link and send /start to the bot."
+  else
+    out "1. Send /start to the visend bot of this server (see \`visend server\` for the link)."
+  fi
+  out "2. The bot will reply with your user id and a one-time code (valid for 1 hour)."
+  out ""
+  ask_user_id user_id "Your user id: "
+  prompt_required code "One-time code: "
+  out "Connecting to $SERVER_URL ..."
+  payload=$(printf '{"user_id": %s, "code": "%s"}' "$user_id" "$(json_escape "$code")")
+  resp=$(curl -sS -m 15 -X POST "$SERVER_URL/connect" \
+    -H "Content-Type: application/json" \
+    -d "$payload") || die "Server connect failed (network error)."
+  if ! tg_ok "$resp"; then
+    if printf '%s' "$resp" | grep -q '"code_burned"'; then
+      die "Too many wrong attempts - the code is burned. Send /start to the bot again for a new one."
+    fi
+    if printf '%s' "$resp" | grep -q '"not_allowed"'; then
+      die "This server does not accept your user id (the admin restricts who can connect)."
+    fi
+    if printf '%s' "$resp" | grep -q '"rate_limited"'; then
+      die "The server rate-limited you. Wait a minute and try again."
+    fi
+    die "The code or user id is wrong (or the code expired). Send /start to the bot again and retry."
+  fi
+  token=$(printf '%s' "$resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  [ -n "$token" ] || die "Server reply did not contain a token."
+  MODE="server"; USER_ID="$user_id"; SERVER_TOKEN="$token"; BOT_TOKEN=""
+  save_config
+  out "Paired with the server."
+  welcome=$(new_tmp)
+  printf 'visend is set up! Everything you pipe will arrive here.' > "$welcome"
+  if resp=$(curl -sS -m 60 -X POST "$SERVER_URL/text" \
+      -H "Authorization: Bearer $SERVER_TOKEN" \
+      -H "Content-Type: text/plain; charset=utf-8" \
+      --data-binary "@$(native_path "$welcome")") && tg_ok "$resp"; then
+    out "Test message sent to your Telegram. Setup complete."
+  else
+    warn "pairing succeeded, but the test message failed."
+  fi
+}
+
+tg_get_updates() {
+  # $1 = JSON payload
+  curl -sS -m 45 -X POST "$TG_API/bot$BOT_TOKEN/getUpdates" \
+    -H "Content-Type: application/json" -d "$1"
+}
+
+handle_409() {
+  out "Another getUpdates poller or a webhook is active on this bot (HTTP 409)."
+  out "This usually means the bot is used by another integration."
+  if ! confirm "Delete the webhook? WARNING: this will break the existing integration."; then
+    return 1
+  fi
+  local resp
+  resp=$(tg_call deleteWebhook -d '{}') || true
+  out "Webhook deleted."
+  return 0
+}
+
+bot_setup() {
+  local token me_username resp last_id deadline found uid uname answer
+  prompt_required token "Bot token (from @BotFather): "
+  if ! printf '%s' "$token" | grep -Eq '^[0-9]{5,}:[A-Za-z0-9_-]{30,}$'; then
+    die "That does not look like a bot token. Expected format: 123456789:AA..."
+  fi
+  BOT_TOKEN="$token"
+  resp=$(tg_call getMe -d '{}') || die "Token check (getMe) failed: network error."
+  if ! tg_ok "$resp"; then
+    die "Token check (getMe) failed: $(tg_description "$resp")."
+  fi
+  me_username=$(printf '%s' "$resp" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
+  out "Token is valid. Bot: @${me_username:-your bot}"
+  out ""
+  out "Now open Telegram and send /start to @${me_username:-your bot}."
+
+  # First call only establishes the baseline update_id (offset=-1 returns
+  # just the latest update); queued stale updates are never shown.
+  found=""
+  declined=0
+  while :; do
+    resp=$(tg_get_updates '{"offset":-1,"limit":1}')
+    if printf '%s' "$resp" | grep -q '"error_code":409'; then
+      if ! handle_409; then declined=1; break; fi
+      continue
+    fi
+    break
+  done
+  last_id=$(printf '%s' "$resp" | sed -n 's/.*"update_id":\([0-9]*\).*/\1/p' | head -n 1)
+  last_id="${last_id:-0}"
+
+  deadline=$(( $(date +%s) + 120 ))
+  if [ -z "$found" ] && [ "$declined" != 1 ]; then
+    out "Waiting for your /start..."
+    while :; do
+      resp=$(tg_get_updates "{\"offset\":$((last_id + 1)),\"timeout\":25,\"limit\":1}")
+      if printf '%s' "$resp" | grep -q '"error_code":409'; then
+        if ! handle_409; then declined=1; break; fi
+        continue
+      fi
+      if printf '%s' "$resp" | grep -q '"update_id"'; then
+        last_id=$(printf '%s' "$resp" | sed -n 's/.*"update_id":\([0-9]*\).*/\1/p' | head -n 1)
+        if printf '%s' "$resp" | grep -q '"text":"/start' && printf '%s' "$resp" | grep -q '"type":"private"'; then
+          uid=$(printf '%s' "$resp" | sed -n 's/.*"from":{"id":\([0-9]*\).*/\1/p')
+          uname=$(printf '%s' "$resp" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
+          found="1"
+          break
+        fi
+      fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+    done
+  fi
+
+  if [ -n "$found" ]; then
+    if [ -n "$uname" ]; then
+      out "Got it: user_id $uid (@$uname)"
+    else
+      out "Got it: user_id $uid (no @username)"
+    fi
+    prompt_var answer "Press Enter to save this user id, or type another one (yours from @userinfobot): "
+    if [ -n "$answer" ]; then
+      if printf '%s' "$answer" | grep -Eq '^[0-9]{1,16}$'; then
+        uid="$answer"
+      else
+        out "That is not a valid id; saving the detected one ($uid)."
+      fi
+    fi
+    MODE="bot"; BOT_TOKEN="$token"; USER_ID="$uid"; SERVER_TOKEN=""
+    save_config
+    out "Saved."
+  else
+    if [ "$declined" = 1 ]; then
+      out "Falling back to manual user id input."
+    else
+      out "Timed out after 120 seconds waiting for /start."
+    fi
+    ask_user_id uid "Enter your user id manually (yours from @userinfobot): "
+    MODE="bot"; BOT_TOKEN="$token"; USER_ID="$uid"; SERVER_TOKEN=""
+    save_config
+    out "Saved."
+  fi
+
+  local welcome
+  welcome=$(new_tmp)
+  printf 'visend is set up! Everything you pipe will arrive here.' > "$welcome"
+  resp=$(tg_call sendMessage \
+    --data-urlencode "chat_id=$USER_ID" \
+    --data-urlencode "text@$welcome") || true
+  if tg_ok "$resp"; then
+    out "Test message sent to your Telegram. Setup complete."
+  else
+    warn "settings saved, but the test message failed: $(tg_description "$resp")."
+  fi
+}
+
+cmd_setup() {
+  local status cfg choice
+  out "visend setup"
+  out ""
+  status=$(server_status)
+  if tg_ok "$status"; then
+    cfg=$(server_config)
+    if tg_ok "$cfg"; then SERVER_CFG_CACHE="$cfg"; else SERVER_CFG_CACHE=""; fi
+  else
+    SERVER_CFG_CACHE=""
+  fi
+  while :; do
+    out "How do you want to receive your messages?"
+    out ""
+    if tg_ok "$status"; then
+      out "  1) Through the shared visend server ($SERVER_URL)"
+    else
+      out "  1) Through the shared visend server ($SERVER_URL)  [currently unavailable]"
+    fi
+    out "  2) Through my own Telegram bot (needs a token from @BotFather)"
+    out "  3) Cancel"
+    prompt_var choice "Choice [1-3]: "
+    case "$choice" in
+      3) die "Setup cancelled." ;;
+      1)
+        if ! tg_ok "$status"; then
+          out ""
+          out "The configured server did not respond, so this option is unavailable right now."
+          out "Check \`visend server\` for details, or host your own server (see README)."
+          out ""
+          continue
+        fi
+        server_setup
+        return 0
+        ;;
+      2) bot_setup; return 0 ;;
+      *) out "Please enter 1, 2 or 3."; out "" ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------- main ---
+
+main() {
+  local cmd subcmd positionals=()
+
+  # Parse flags (flags come after positional arguments, but accept them anywhere).
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) ASSUME_YES=1 ;;
+      --force-as-text) FORCE_AS_TEXT=1 ;;
+      --name)
+        [ $# -ge 2 ] || die "--name requires a value: --name <name>"
+        OPT_NAME="$2"; shift
+        ;;
+      --name=*) OPT_NAME="${1#--name=}" ;;
+      -h|--help)
+        cmd_help
+        exit 0
+        ;;
+      --) shift; args+=("$@"); break ;;
+      -*) die "Unknown flag \"$1\". Run \`visend help\`." ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+
+  cmd="${args[0]:-}"
+  if [ -z "$cmd" ]; then
+    if stdin_piped; then
+      cmd="text"
+    else
+      cmd_help
+      exit 0
+    fi
+  else
+    shift_args=("${args[@]:1}")
+  fi
+
+  # Join remaining positionals for text/file.
+  local rest=""
+  if [ ${#args[@]} -gt 1 ]; then
+    rest="${args[@]:1}"
+  fi
+
+  case "$cmd" in
+    help)
+      cmd_help
+      ;;
+    text)
+      cmd_text "$rest"
+      ;;
+    file)
+      cmd_file "${args[1]:-}"
+      ;;
+    setup)
+      cmd_setup
+      ;;
+    settings)
+      cmd_settings
+      ;;
+    forget)
+      cmd_forget
+      ;;
+    server)
+      subcmd="${args[1]:-}"
+      case "$subcmd" in
+        set)
+          [ -n "${args[2]:-}" ] || die "Usage: visend server set <url>   e.g. visend server set http://example.com:6767/test/misc/visend"
+          cmd_server_set "${args[2]}"
+          ;;
+        reset)
+          cmd_server_reset
+          ;;
+        "")
+          cmd_server_show
+          ;;
+        *)
+          die "Unknown subcommand \"$subcmd\". Use \`visend server\`, \`visend server set <url>\` or \`visend server reset\`."
+          ;;
+      esac
+      ;;
+    *)
+      die "Unknown command \"$cmd\". Run \`visend help\` to see the available commands."
+      ;;
+  esac
+}
+
+main "$@"
