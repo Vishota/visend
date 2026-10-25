@@ -91,6 +91,19 @@ export function buildApp(deps: {
       rejectEarly(res, req, 429, 'too_many_uploads', 'Too many concurrent uploads; retry in a moment.');
       return;
     }
+    // Take the slot and arm the release handlers BEFORE awaiting anything:
+    // even if the verifier ever yields to the event loop, an aborted client
+    // cannot leak the slot.
+    inFlightUploads++;
+    let released = false;
+    const release = () => {
+      if (!released) {
+        released = true;
+        inFlightUploads--;
+      }
+    };
+    res.on('finish', release);
+    res.on('close', release);
     verifyToken(match[1], 'access')
       .then((result) => {
         if (!result.ok) {
@@ -102,17 +115,6 @@ export function buildApp(deps: {
           rejectEarly(res, req, 401, error, description);
           return;
         }
-        // Token is fine: read the body, then hand the user_id to the route.
-        inFlightUploads++;
-        let released = false;
-        const release = () => {
-          if (!released) {
-            released = true;
-            inFlightUploads--;
-          }
-        };
-        res.on('finish', release);
-        res.on('close', release);
         (req as Request & { userId?: number }).userId = result.userId;
         next();
       })
@@ -140,13 +142,17 @@ export function buildApp(deps: {
 
   app.post(
     '/connect',
+    // Rate limit from the socket before spending cycles on body parsing.
+    (req: Request, res: Response, next: NextFunction) => {
+      if (rateLimited(req.ip || req.socket.remoteAddress || 'unknown')) {
+        fail(res, 429, 'rate_limited', 'Too many connect attempts from your IP; wait a minute.');
+        return;
+      }
+      next();
+    },
     express.json({ limit: '4kb' }),
     async (req: Request, res: Response, next: NextFunction) => {
       try {
-        if (rateLimited(req.ip || req.socket.remoteAddress || 'unknown')) {
-          fail(res, 429, 'rate_limited', 'Too many connect attempts from your IP; wait a minute.');
-          return;
-        }
         const userId = Number(req.body && req.body.user_id);
         const code = String((req.body && req.body.code) || '').toUpperCase();
         if (!Number.isInteger(userId) || userId <= 0 || !/^[A-Z0-9]{1,32}$/.test(code)) {
@@ -220,6 +226,14 @@ export function buildApp(deps: {
         fail(res, 400, 'empty_text', 'Request body is empty.');
         return;
       }
+      // Chunked bodies (no Content-Length) bypass the early gate; keep the
+      // post-buffer check symmetric with /file.
+      if (body.length > config.maxFileSize) {
+        fail(res, 413, 'file_too_large', 'The request exceeds the server size limit.', {
+          max_file_size: config.maxFileSize,
+        });
+        return;
+      }
       try {
         const result = await sendMessage(userId, body.toString('utf8'));
         res.json({ ok: true, message_id: result.message_id });
@@ -282,6 +296,23 @@ export function buildApp(deps: {
     // Full details go to the logs only; clients get a generic message.
     console.error('[http] unhandled error:', err.stack || err.message);
     if (res.headersSent) return;
+    // Body-parser errors carry their own status (400 malformed JSON,
+    // 413 over the raw limit) - honor them instead of a 500.
+    const parserError = err as Error & { statusCode?: number; status?: number };
+    const status = parserError.statusCode || parserError.status;
+    if (status === 400) {
+      res.status(400).json({ ok: false, error: 'bad_request', description: 'Malformed request body.' });
+      return;
+    }
+    if (status === 413) {
+      res.status(413).json({
+        ok: false,
+        error: 'file_too_large',
+        description: 'The request exceeds the server size limit.',
+        max_file_size: config.maxFileSize,
+      });
+      return;
+    }
     res.status(500).json({ ok: false, error: 'internal', description: 'Internal server error.' });
   });
 

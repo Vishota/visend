@@ -418,6 +418,14 @@ async function main() {
   rr = await runCli(['text'], { stdin: hugeText });
   ok('text fallback >50MB blocked locally with clear message', rr.code === 1 && /50 MB/.test(rr.err), rr.err.slice(0, 200));
 
+  // server set: switching servers wipes BOTH tokens (access + refresh)
+  writeConfig({ mode: 'server', user_id: 4242, server_token: SRV.token, server_refresh_token: SRV.refresh, server_url: SRV.url });
+  const mock3 = await createMockServer(0);
+  rr = await runCli(['server', 'set', mock3.url, '-y']);
+  const cfgWipe = readConfigRaw();
+  ok('server set wipes the whole token pair', rr.code === 0 && !cfgWipe.server_token && !cfgWipe.server_refresh_token, rr.out + rr.err);
+  mock3.server.close();
+
   // no tty & no -y on the binary confirm still fails cleanly
   rr = await runCli(['text'], { stdin: Buffer.concat([Buffer.from([0, 1, 2]), Buffer.alloc(20, 0x61)]) });
   ok('binary confirm without tty errors', rr.code === 1 && /interactive terminal/.test(rr.err));

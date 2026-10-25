@@ -62,12 +62,13 @@ async function applyServerUrl(newUrl, yes) {
     out('Server URL is already ' + newUrl + ' - nothing to change.');
     return;
   }
-  if (cfg.mode === 'server' && cfg.server_token) {
+  if (cfg.mode === 'server' && (cfg.server_token || cfg.server_refresh_token)) {
     delete cfg.server_token;
+    delete cfg.server_refresh_token;
     config.save(cfg);
     out('Server URL saved.');
     out('');
-    out('Note: for security the old server token has been removed - the new server will');
+    out('Note: for security the old token pair has been removed - the new server will');
     out('not accept it. Run `visend setup` again and enter a new one-time code.');
     return;
   }

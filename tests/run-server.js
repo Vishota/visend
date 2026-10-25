@@ -313,6 +313,11 @@ async function main() {
   r = await headOnly(base2 + '/file?name=x', 'POST', { Authorization: 'Bearer ' + rotatedAccess, 'Content-Length': '999999999' });
   ok('oversized declared Content-Length answered 413 before body read', r === 413, 'status=' + r);
 
+  // --- body-parser errors map to 400/413, not 500 ---
+  r = await httpJson(base2 + '/connect', 'POST', { 'Content-Type': 'application/json' }, '{not json');
+  ok('malformed JSON -> 400 bad_request (not 500)', r.status === 400 && r.json && r.json.error === 'bad_request',
+    'status=' + r.status + ' raw=' + String(r.raw).slice(0, 120));
+
   // --- X-Forwarded-For is NOT trusted without TRUST_PROXY (rate limit holds) ---
   // Runs BEFORE server3 spawns: while two pollers are alive, both servers
   // consume /start updates and issue their own codes, making code extraction

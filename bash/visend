@@ -666,12 +666,13 @@ apply_server_url() {
     return 0
   fi
   SERVER_URL="$new_url"
-  if [ "$MODE" = "server" ] && [ -n "$SERVER_TOKEN" ]; then
+  if [ "$MODE" = "server" ] && { [ -n "$SERVER_TOKEN" ] || [ -n "$SERVER_REFRESH_TOKEN" ]; }; then
     SERVER_TOKEN=""
+    SERVER_REFRESH_TOKEN=""
     save_config
     out "Server URL saved."
     out ""
-    out "Note: for security the old server token has been removed - the new server will"
+    out "Note: for security the old token pair has been removed - the new server will"
     out "not accept it. Run \`visend setup\` again and enter a new one-time code."
     return 0
   fi
@@ -778,9 +779,9 @@ server_setup() {
 }
 
 tg_get_updates() {
-  # $1 = JSON payload
-  curl -sS -m 45 -X POST "$TG_API/bot$BOT_TOKEN/getUpdates" \
-    -H "Content-Type: application/json" -d "$1"
+  # $1 = JSON payload; the URL carries the bot token -> keep it out of argv
+  printf 'url = "%s/bot%s/getUpdates"\nrequest = "POST"\n' "$TG_API" "$BOT_TOKEN" |
+    curl -sS -m 45 -K - -H "Content-Type: application/json" -d "$1"
 }
 
 handle_409() {

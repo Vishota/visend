@@ -11,7 +11,7 @@
 #
 # Usage: visend.ps1 [command] [args] [-y] [--name <name>] [--force-as-text]
 
-#require -Version 5.1
+#requires -Version 5.1
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -500,6 +500,12 @@ function Cmd-File([string[]]$Positional) {
     Send-File $cfg $bytes $name
 }
 
+function Get-Masked([string]$Secret) {
+    if (-not $Secret) { return 'not set' }
+    if ($Secret.Length -le 8) { return '****' }
+    return $Secret.Substring(0, 4) + '...' + $Secret.Substring($Secret.Length - 4)
+}
+
 function Cmd-Settings {
     $cfg = Load-Config
     Write-Out2 "Settings file: $(Get-ConfigPath)"
@@ -510,9 +516,9 @@ function Cmd-Settings {
     $srv = Get-EffectiveServerUrl $cfg
     $isDefault = -not $cfg['server_url']
     Write-Out2 "Server URL:    $srv$(if ($isDefault) { ' (default)' })"
-    Write-Out2 "Bot token:     $(if ($cfg['bot_token']) { "$($cfg['bot_token'].ToString().Substring(0,4))...$($cfg['bot_token'].ToString().Substring($cfg['bot_token'].ToString().Length-4))" } else { 'not set' })"
-    Write-Out2 "Server token:  $(if ($cfg['server_token']) { "$($cfg['server_token'].ToString().Substring(0,4))...$($cfg['server_token'].ToString().Substring($cfg['server_token'].ToString().Length-4))" } else { 'not set' })"
-    Write-Out2 "Refresh token: $(if ($cfg['server_refresh_token']) { "$($cfg['server_refresh_token'].ToString().Substring(0,4))...$($cfg['server_refresh_token'].ToString().Substring($cfg['server_refresh_token'].ToString().Length-4))" } else { 'not set' })"
+    Write-Out2 "Bot token:     $(Get-Masked "$($cfg['bot_token'])")"
+    Write-Out2 "Server token:  $(Get-Masked "$($cfg['server_token'])")"
+    Write-Out2 "Refresh token: $(Get-Masked "$($cfg['server_refresh_token'])")"
 }
 
 function Cmd-Forget {
@@ -586,12 +592,13 @@ function Apply-ServerUrl([hashtable]$Cfg, [string]$NewUrl) {
     } else {
         $Cfg['server_url'] = $NewUrl
     }
-    if ($Cfg['mode'] -eq 'server' -and $Cfg['server_token']) {
+    if ($Cfg['mode'] -eq 'server' -and ($Cfg['server_token'] -or $Cfg['server_refresh_token'])) {
         $Cfg.Remove('server_token')
+        $Cfg.Remove('server_refresh_token')
         Save-Config $Cfg
         Write-Out2 'Server URL saved.'
         Write-Out2 ''
-        Write-Out2 'Note: for security the old server token has been removed - the new server will'
+        Write-Out2 'Note: for security the old token pair has been removed - the new server will'
         Write-Out2 'not accept it. Run "visend setup" again and enter a new one-time code.'
         return
     }

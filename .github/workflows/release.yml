@@ -206,7 +206,7 @@ jobs:
           PKG=$(node -p "require('./nodejs/package.json').version")
           [ "$VER" = "$PKG" ] || { echo "version mismatch: tag=$VER pkg=$PKG"; exit 1; }
       - name: Package README + LICENSE from the repo root
-        run: cp README.md LICENSE nodejs/README.md
+        run: cp README.md LICENSE nodejs/
       - name: Publish
         working-directory: nodejs
         run: npm publish --access public
