@@ -4,7 +4,7 @@
 # PR to microsoft/winget-pkgs.
 #
 # yamllint disable
-Id: vishota.visend.__VERSION__
+Id: vishota.visend
 Version: __VERSION__
 PackageName: visend
 Publisher: vishota

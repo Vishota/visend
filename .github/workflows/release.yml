@@ -58,11 +58,24 @@ jobs:
             "$env:GITHUB_WORKSPACE/powershell/visend.ps1", [ref]$null, [ref]$errs)
           if ($errs.Count -gt 0) { $errs | ForEach-Object { $_.Message }; exit 1 }
 
+  # Behavior of the PowerShell port is only provable on real Windows
+  # PowerShell 5.1 - run the full e2e suite on a windows runner.
+  lint-windows:
+    name: powershell e2e (windows, PS 5.1)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: PowerShell CLI e2e (mock Telegram + mock server)
+        run: node tests/run-ps.js
+
   # --------------------------------------------------------------- build ---
   build:
     name: build artifacts
     runs-on: ubuntu-24.04
-    needs: lint
+    needs: [lint, lint-windows]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -179,7 +192,7 @@ jobs:
   npm:
     name: npm publish
     runs-on: ubuntu-24.04
-    needs: lint
+    needs: [lint, lint-windows]
     if: github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v4
@@ -192,8 +205,8 @@ jobs:
           VER="${GITHUB_REF_NAME#v}"
           PKG=$(node -p "require('./nodejs/package.json').version")
           [ "$VER" = "$PKG" ] || { echo "version mismatch: tag=$VER pkg=$PKG"; exit 1; }
-      - name: Package README from the repo root
-        run: cp README.md nodejs/README.md
+      - name: Package README + LICENSE from the repo root
+        run: cp README.md LICENSE nodejs/README.md
       - name: Publish
         working-directory: nodejs
         run: npm publish --access public
@@ -226,12 +239,15 @@ jobs:
           git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           if git fetch origin gh-pages; then
             git checkout -B gh-pages origin/gh-pages
-            # wipe previous repo content, keep history
-            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            # Rebuild indexes from scratch, but KEEP the package pools
+            # (apt/pool + apk arch dirs) so older released versions stay
+            # installable. Index files are simply regenerated below.
+            rm -rf dists
           else
             git checkout --orphan gh-pages
             git rm -rf --ignore-unmatch . 2>/dev/null || true
           fi
+          mkdir -p apt/pool/main/v/visend dists/stable/main/binary-amd64 apk/x86_64 apk/aarch64
       - name: Assemble + sign apt repository
         env:
           APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
@@ -343,7 +359,7 @@ jobs:
   docker:
     name: docker image (ghcr)
     runs-on: ubuntu-24.04
-    needs: lint
+    needs: [lint, lint-windows]
     if: github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v4

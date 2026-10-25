@@ -381,6 +381,47 @@ async function main() {
   await testServerMode();
   await testSetupInProcess();
 
+  // --- refresh flow: expired access token -> auto refresh -> retry -> persist ---
+  process.stdout.write('\n== server mode: refresh flow ==\n');
+  let rr;
+  await httpGetJson(SRV.url + '/__reset');
+  writeConfig({
+    mode: 'server', user_id: 4242,
+    server_token: 'expired-access-token', server_refresh_token: SRV.refresh,
+    server_url: SRV.url,
+  });
+  await httpGetJson(SRV.url + '/__expire?token=expired-access-token');
+  rr = await runCli([], { stdin: 'after refresh\n' });
+  let cfgAfter = readConfigRaw();
+  let srvSent2 = await httpGetJson(SRV.url + '/__sent');
+  ok('401 token_expired -> auto-refresh -> retry -> persist',
+    rr.code === 0 && srvSent2.texts.length === 1 && srvSent2.texts[0] === 'after refresh\n' &&
+    cfgAfter.server_token && cfgAfter.server_token !== 'expired-access-token' &&
+    cfgAfter.server_refresh_token === SRV.refresh,
+    rr.out + rr.err);
+
+  writeConfig({
+    mode: 'server', user_id: 4242,
+    server_token: 'expired-access-2', server_refresh_token: 'bad-refresh',
+    server_url: SRV.url,
+  });
+  await httpGetJson(SRV.url + '/__expire?token=expired-access-2');
+  rr = await runCli(['text'], { stdin: 'x' });
+  ok('bad refresh token -> re-setup hint', rr.code === 1 && /visend setup/.test(rr.err), rr.err);
+
+  writeConfig({ mode: 'server', user_id: 4242, server_token: SRV.refresh, server_url: SRV.url });
+  rr = await runCli(['text'], { stdin: 'x' });
+  ok('refresh token cannot act as access token', rr.code === 1 && /setup/.test(rr.err), rr.err);
+
+  // --- text -> file fallback must respect the 50 MB guard ---
+  const hugeText = Buffer.alloc(51 * 1024 * 1024 + 100, 0x61); // 'a' x 51MB, >4096 chars, not binary
+  rr = await runCli(['text'], { stdin: hugeText });
+  ok('text fallback >50MB blocked locally with clear message', rr.code === 1 && /50 MB/.test(rr.err), rr.err.slice(0, 200));
+
+  // no tty & no -y on the binary confirm still fails cleanly
+  rr = await runCli(['text'], { stdin: Buffer.concat([Buffer.from([0, 1, 2]), Buffer.alloc(20, 0x61)]) });
+  ok('binary confirm without tty errors', rr.code === 1 && /interactive terminal/.test(rr.err));
+
   process.stdout.write('\n================================\n');
   process.stdout.write('passed: ' + passed + ', failed: ' + failed + '\n');
   if (failed) {

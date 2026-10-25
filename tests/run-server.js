@@ -138,8 +138,9 @@ async function main() {
 
   // wrong code was consumed? no - code survives up to 5 attempts
   r = await httpJson(base + '/connect', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({ user_id: 4242, code: code }));
-  ok('connect returns token', r.status === 200 && r.json.ok === true && typeof r.json.token === 'string' && r.json.token.length > 20, r.raw);
+  ok('connect returns token pair', r.status === 200 && r.json.ok === true && typeof r.json.token === 'string' && r.json.token.length > 20 && typeof r.json.refresh_token === 'string' && r.json.refresh_token.length > 20, r.raw);
   const token = r.json && r.json.token;
+  const refreshToken = r.json && r.json.refresh_token;
 
   // code is one-time
   r = await httpJson(base + '/connect', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({ user_id: 4242, code: code }));
@@ -280,7 +281,149 @@ async function main() {
     ok('same secret => token survives restart', r.status === 200, r.raw);
   }
 
+  // ====================== hardening: token lifecycle + gates ======================
+  process.stdout.write('\n== hardening: refresh flow, early gates, concurrency ==\n');
+
+  // --- /refresh semantics on server2 (access token cannot act as refresh) ---
+  r = await httpJson(base2 + '/refresh', 'POST', { Authorization: 'Bearer ' + token }, '');
+  ok('access token rejected on /refresh (typ separation)', r.status === 401, r.raw);
+
+  r = await httpJson(base2 + '/refresh', 'POST', { Authorization: 'Bearer ' + refreshToken }, '');
+  ok('refresh token -> new pair', r.status === 200 && r.json.token && r.json.refresh_token && r.json.token !== token, r.raw);
+  const rotatedAccess = r.json && r.json.token;
+  r = await httpJson(base2 + '/text', 'POST', { Authorization: 'Bearer ' + rotatedAccess, 'Content-Type': 'text/plain' }, 'rotated access works');
+  ok('rotated access token works', r.status === 200, r.raw);
+
+  // --- early gates: answered from headers alone, before any body is read ---
+  function headOnly(url, method, headers) {
+    return new Promise(function (resolve) {
+      const u = new URL(url);
+      const req = http.request(
+        { hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: method, headers: headers },
+        function (res) { resolve(res.statusCode); req.destroy(); }
+      );
+      req.on('error', function () { /* destroyed on purpose */ });
+      // one byte flushes the headers; the (huge) declared body never arrives
+      req.write('x');
+    });
+  }
+  r = await headOnly(base2 + '/file?name=x', 'POST', { 'Content-Length': '999999999' });
+  ok('no-auth request answered 401 before body read', r === 401, 'status=' + r);
+
+  r = await headOnly(base2 + '/file?name=x', 'POST', { Authorization: 'Bearer ' + rotatedAccess, 'Content-Length': '999999999' });
+  ok('oversized declared Content-Length answered 413 before body read', r === 413, 'status=' + r);
+
+  // --- X-Forwarded-For is NOT trusted without TRUST_PROXY (rate limit holds) ---
+  // Runs BEFORE server3 spawns: while two pollers are alive, both servers
+  // consume /start updates and issue their own codes, making code extraction
+  // racy. server2 is killed here so server3 becomes the sole poller.
+  let saw429xff = false;
+  for (let i = 0; i < 12; i++) {
+    r = await httpJson(base2 + '/connect', 'POST',
+      { 'Content-Type': 'application/json', 'X-Forwarded-For': '9.9.9.' + i },
+      JSON.stringify({ user_id: 31337, code: 'ZZZZZZZZ' }));
+    if (r.status === 429) { saw429xff = true; break; }
+  }
+  ok('spoofed X-Forwarded-For does not bypass rate limit', saw429xff);
+
   server2.kill();
+  await new Promise(function (res) { setTimeout(res, 500); });
+
+  // --- real token expiry + client-style refresh on a short-TTL instance ---
+  const server3 = spawn(process.execPath, [SERVER_ENTRY], {
+    env: Object.assign({}, process.env, {
+      TELEGRAM_BOT_TOKEN: tg.token,
+      SERVER_SECRET: 'integration-test-secret',
+      TELEGRAM_API_BASE: 'http://127.0.0.1:' + tg.port,
+      ACCESS_TOKEN_TTL: '1s',
+      REFRESH_TOKEN_TTL: '1000d',
+      MAX_CONCURRENT_UPLOADS: '1',
+      PORT: '0',
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let log3 = '';
+  server3.stdout.on('data', function (c) { log3 += c; });
+  server3.stderr.on('data', function (c) { log3 += c; });
+  const base3 = 'http://127.0.0.1:' + await new Promise(function (resolve) {
+    const wait = setInterval(function () {
+      const m = /listening on :(\\d+|\d+)/.exec(log3);
+      if (m) { clearInterval(wait); resolve(m[1]); }
+    }, 200);
+    setTimeout(function () { clearInterval(wait); resolve(null); }, 15000);
+  });
+  await waitForServer(base3 + '/status', 10000);
+
+  await httpGetJsonMock('http://127.0.0.1:' + tg.port + '/__push?user_id=777&text=/start');
+  let code3 = null;
+  for (let i = 0; i < 40 && !code3; i++) {
+    await new Promise(function (res) { setTimeout(res, 250); });
+    const s = await httpGetJsonMock('http://127.0.0.1:' + tg.port + '/__sent');
+    for (const msg of s.messages) {
+      const m = /One-time code: ([A-Z0-9]{8})/.exec(msg.text || '');
+      if (m) code3 = m[1];
+    }
+  }
+  r = await httpJson(base3 + '/connect', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({ user_id: 777, code: code3 }));
+  const shortAccess = r.json && r.json.token;
+  const shortRefresh = r.json && r.json.refresh_token;
+  r = await httpJson(base3 + '/text', 'POST', { Authorization: 'Bearer ' + shortAccess, 'Content-Type': 'text/plain' }, 'fresh short token works');
+  ok('short-TTL access works right after connect', r.status === 200, r.raw);
+
+  await new Promise(function (res) { setTimeout(res, 1600); });
+  r = await httpJson(base3 + '/text', 'POST', { Authorization: 'Bearer ' + shortAccess, 'Content-Type': 'text/plain' }, 'expired?');
+  ok('expired access -> 401 token_expired', r.status === 401 && r.json.error === 'token_expired', r.raw);
+
+  r = await httpJson(base3 + '/refresh', 'POST', { Authorization: 'Bearer ' + shortRefresh }, '');
+  ok('refresh revives the pair after expiry', r.status === 200 && r.json.token, r.raw);
+  r = await httpJson(base3 + '/text', 'POST', { Authorization: 'Bearer ' + r.json.token, 'Content-Type': 'text/plain' }, 'after refresh');
+  ok('text works after refresh', r.status === 200, r.raw);
+
+  // --- concurrency cap: MAX_CONCURRENT_UPLOADS=1 + held sendDocument ---
+  await httpGetJsonMock('http://127.0.0.1:' + tg.port + '/__holdsend?ms=800');
+  // fresh one-time code (the previous one was consumed)
+  await httpGetJsonMock('http://127.0.0.1:' + tg.port + '/__push?user_id=777&text=/start');
+  let code3b = null;
+  for (let i = 0; i < 40 && !code3b; i++) {
+    await new Promise(function (res) { setTimeout(res, 250); });
+    const s = await httpGetJsonMock('http://127.0.0.1:' + tg.port + '/__sent');
+    for (const msg of s.messages) {
+      const m = /One-time code: ([A-Z0-9]{8})/.exec(msg.text || '');
+      if (m && m[1] !== code3) code3b = m[1];
+    }
+  }
+  const pair = await httpJson(base3 + '/connect', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({ user_id: 777, code: code3b }));
+  const cAccess = pair.json && pair.json.token;
+  const slow1 = httpJson(base3 + '/file?name=a.bin', 'POST', { Authorization: 'Bearer ' + cAccess }, Buffer.alloc(1024).fill(1));
+  const slow2 = httpJson(base3 + '/file?name=b.bin', 'POST', { Authorization: 'Bearer ' + cAccess }, Buffer.alloc(1024).fill(2));
+  const [s1, s2] = await Promise.all([slow1, slow2]);
+  const statuses = [s1.status, s2.status].sort();
+  ok('second concurrent upload gets 429 (cap=1)', statuses[0] === 200 && statuses[1] === 429, JSON.stringify(statuses));
+  await httpGetJsonMock('http://127.0.0.1:' + tg.port + '/__holdsend?ms=0');
+  server3.kill();
+
+  // --- ALLOWED_USER_IDS fail-closed: garbage value must stop the server ---
+  const server4 = spawn(process.execPath, [SERVER_ENTRY], {
+    env: Object.assign({}, process.env, {
+      TELEGRAM_BOT_TOKEN: tg.token,
+      SERVER_SECRET: 'integration-test-secret',
+      TELEGRAM_API_BASE: 'http://127.0.0.1:' + tg.port,
+      ALLOWED_USER_IDS: 'abc,def',
+      PORT: '0',
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let log4 = '';
+  server4.stdout.on('data', function (c) { log4 += c; });
+  server4.stderr.on('data', function (c) { log4 += c; });
+  const exit4 = await new Promise(function (resolve) {
+    server4.on('close', function (code) { resolve(code); });
+    setTimeout(function () { resolve('timeout'); }, 10000);
+  });
+  ok('garbage ALLOWED_USER_IDS refuses to start (fail-closed)',
+    exit4 !== 'timeout' && exit4 !== 0 && /ALLOWED_USER_IDS/.test(log4),
+    'exit=' + exit4 + ' log=' + log4.slice(-200));
+  server4.kill();
   tg.server.close();
 
   process.stdout.write('\n================================\n');

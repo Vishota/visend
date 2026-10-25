@@ -6,6 +6,13 @@
 #   docker compose -f compose.example.yml up -d
 #
 # Then on your machine: visend server set https://your.host[:port] && visend setup
+#
+# NOTE: this example exposes plain HTTP. Pairing codes, tokens and payload
+# travel unencrypted unless you front the container with a TLS-terminating
+# reverse proxy (Caddy/Traefik/nginx). For anything beyond localhost use
+# https:// - the CLI warns loudly about http:// server URLs.
+# Set TRUST_PROXY=1 only when such a proxy is in front (it makes the server
+# trust X-Forwarded-For for rate limiting).
 
 services:
   visend-server:

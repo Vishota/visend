@@ -5,15 +5,19 @@ const telegram = require('./telegram');
 const serverapi = require('./serverapi');
 const { VisendError } = require('./errors');
 
+const TELEGRAM_FILE_LIMIT = 50 * 1024 * 1024;
+
 function requireConfig() {
   const cfg = config.load();
   if (cfg.mode === 'bot' && cfg.bot_token && cfg.user_id) return cfg;
-  if (cfg.mode === 'server' && cfg.server_token && cfg.user_id) return cfg;
-  if (cfg.mode === 'server' && !cfg.server_token) {
-    throw new VisendError(
-      'The server token is missing (the server URL was changed after setup). ' +
-      'Run `visend setup` again to get a new one-time code.'
-    );
+  if (cfg.mode === 'server' && cfg.user_id) {
+    if (!cfg.server_token && !cfg.server_refresh_token) {
+      throw new VisendError(
+        'The server token is missing (the server URL was changed after setup). ' +
+        'Run `visend setup` again to get a new one-time code.'
+      );
+    }
+    return cfg;
   }
   throw new VisendError('visend is not configured yet. Run `visend setup` first.');
 }
@@ -37,9 +41,48 @@ function describeServerError(err) {
       ' (this is a server-side limit, not the Telegram one).';
   }
   if (err instanceof serverapi.ServerError && err.status === 401) {
+    if (err.code === 'token_expired') {
+      return 'The access token expired and the refresh token did not work. Run `visend setup` again.';
+    }
     return 'The server rejected the token. Run `visend setup` again to get a new one-time code.';
   }
   return err.message;
+}
+
+// Run a server request; on 401 (expired access) refresh the token pair,
+// persist it and retry the request once.
+async function withRefresh(cfg, fn) {
+  const url = config.effectiveServerUrl(cfg);
+  if (!cfg.server_token && cfg.server_refresh_token) {
+    // Nothing to retry with yet - go straight to refresh.
+    await rotateTokens(cfg);
+  }
+  try {
+    return await fn(url, cfg.server_token);
+  } catch (err) {
+    if (!(err instanceof serverapi.ServerError) || err.status !== 401) throw err;
+    if (!cfg.server_refresh_token) throw err;
+    await rotateTokens(cfg);
+    return await fn(url, cfg.server_token);
+  }
+}
+
+async function rotateTokens(cfg) {
+  const url = config.effectiveServerUrl(cfg);
+  let pair;
+  try {
+    pair = await serverapi.refresh(url, cfg.server_refresh_token);
+  } catch (err) {
+    if (err instanceof serverapi.ServerError && err.status === 401) {
+      throw new VisendError(
+        'The refresh token is invalid or expired. Run `visend setup` again to get a new one-time code.'
+      );
+    }
+    throw err;
+  }
+  cfg.server_token = pair.token;
+  cfg.server_refresh_token = pair.refresh_token;
+  config.save(cfg);
 }
 
 async function deliverText(cfg, textBuf) {
@@ -53,10 +96,12 @@ async function deliverText(cfg, textBuf) {
       throw new VisendError(describeTelegramError(err));
     }
   }
-  const url = config.effectiveServerUrl(cfg);
   try {
-    const result = await serverapi.sendText(url, cfg.server_token, textBuf);
-    return 'Text sent to Telegram via ' + url + ' (message_id ' + (result.message_id || '?') + ').';
+    const result = await withRefresh(cfg, function (url, token) {
+      return serverapi.sendText(url, token, textBuf);
+    });
+    return 'Text sent to Telegram via ' + config.effectiveServerUrl(cfg) +
+      ' (message_id ' + (result.message_id || '?') + ').';
   } catch (err) {
     throw new VisendError(describeServerError(err));
   }
@@ -64,6 +109,13 @@ async function deliverText(cfg, textBuf) {
 
 async function deliverFile(cfg, buf, name) {
   const sizeMb = Math.round(buf.length / (1024 * 1024) * 10) / 10;
+  // Telegram bot API hard limit - applies to every delivery path, including
+  // the text->file fallback for >4096-char input.
+  if (buf.length > TELEGRAM_FILE_LIMIT) {
+    throw new VisendError(
+      'The file is ' + sizeMb + ' MB, but Telegram bots can only send files up to 50 MB.'
+    );
+  }
   if (cfg.mode === 'bot') {
     try {
       await telegram.sendDocument(cfg.bot_token, cfg.user_id, buf, name);
@@ -72,10 +124,12 @@ async function deliverFile(cfg, buf, name) {
       throw new VisendError(describeTelegramError(err));
     }
   }
-  const url = config.effectiveServerUrl(cfg);
   try {
-    await serverapi.sendFile(url, cfg.server_token, buf, name);
-    return 'File "' + name + '" (' + sizeMb + ' MB) sent to Telegram via ' + url + '.';
+    const result = await withRefresh(cfg, function (url, token) {
+      return serverapi.sendFile(url, token, buf, name);
+    });
+    return 'File "' + name + '" (' + sizeMb + ' MB) sent to Telegram via ' +
+      config.effectiveServerUrl(cfg) + '.';
   } catch (err) {
     throw new VisendError(describeServerError(err));
   }

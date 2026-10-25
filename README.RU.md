@@ -66,18 +66,20 @@ yay -S visend        # или любой AUR-хелпер
 
 ### Windows
 
-- **scoop** (портабельный exe, node не нужен):
+Сейчас работают три способа:
 
-  ```powershell
-  scoop bucket add vishota https://github.com/vishota/scoop-bucket
-  scoop install visend
-  ```
+- **npm** (при установленном node): `npm i -g visend` или `npx visend`.
+- **PowerShell-скрипт** (node не нужен): скачайте
+  [powershell/visend.ps1](powershell/visend.ps1), запускайте
+  `visend.ps1 text "привет"`; нативные пайпы (`type file.log | visend.ps1 file`)
+  бинарно-безопасны. Нюанс: пайп изнутри PowerShell-сессии
+  (`"x" | visend.ps1`) не поддерживается — передавайте текст аргументом или
+  пайпьте из программ.
+- **Git Bash / WSL**: bash-версия или npm.
 
-- **winget** — в процессе (фаза 2, PR в `microsoft/winget-pkgs`).
-- Вручную: скачайте `visend-<version>-win-x64.zip` со страницы
-  [релизов](https://github.com/vishota/visend/releases), распакуйте, добавьте в
-  `PATH`.
-- PowerShell без exe: скрипт `powershell/visend.ps1` из этого репозитория.
+Запланировано (фаза 2, пока недоступно): портабельный exe-zip, scoop и winget.
+Шаблоны манифестов лежат в `packaging/`; пока нет билд-джобы, файла
+`visend-<version>-win-x64.zip` не существует.
 
 ## Настройка
 
@@ -145,9 +147,11 @@ visend help
 - **Свой бот**: CLI ходит в Telegram Bot API напрямую, токен хранится только
   у вас.
 - **Сервер**: одноразовое сопряжение по коду (бот выдаёт на `/start`, код
-  живёт 1 час, 5 неверных попыток сжигают его), затем JWT, подписанный
-  секретом сервера. Сервер токены не хранит: сменили `SERVER_SECRET` — все
-  токены отозваны.
+  живёт 1 час, 5 неверных попыток сжигают его), затем **пара токенов**:
+  access на 24 часа и ротируемый refresh на 180 дней (JWT, HS256, внутри только
+  user_id и тип). Когда access истекает, CLI сам обновляет пару, сохраняет её и
+  повторяет запрос — для вас это незаметно. Сервер токены не хранит: сменили
+  `SERVER_SECRET` — все токены отозваны.
 
 ## Свой сервер
 
@@ -183,12 +187,19 @@ visend setup
 |---|---|---|
 | Токен бота | docker secret `telegram_bot_token` / env `TELEGRAM_BOT_TOKEN` | обязателен |
 | Секрет подписи токенов | docker secret `server_secret` / env `SERVER_SECRET` | обязателен; одинаковый секрет = токены живут через рестарты; смена = отзыв всех |
-| Белый список user id | env `ALLOWED_USER_IDS=123,456` | опционально; кто может сопрягаться |
-| Макс. размер файла | env `MAX_FILE_SIZE` (байты, по умолчанию 50 МБ) | опционально |
+| Белый список user id | env `ALLOWED_USER_IDS=123,456` | опционально; мусорное значение = отказ старта (fail-closed) |
+| Макс. размер файла | env `MAX_FILE_SIZE` (байты, по умолчанию 50 МБ) | также ранний гейт по Content-Length |
+| Макс. одновременных загрузок | env `MAX_CONCURRENT_UPLOADS` (по умолчанию 8) | память: auth и заявленный размер проверяются ДО чтения тела |
+| TTL access-токена | env `ACCESS_TOKEN_TTL` (по умолчанию `24h`) | истёк -> 401 `token_expired`, клиент сам обновляет |
+| TTL refresh-токена | env `REFRESH_TOKEN_TTL` (по умолчанию `180d`) | ротируется при каждом обновлении |
+| Доверять реверс-прокси | env `TRUST_PROXY=1` | только тогда X-Forwarded-For участвует в rate limit |
 | Порт | env `PORT` (по умолчанию 8080) | |
 
 Эндпоинты: `GET /status`, `GET /config`, `POST /connect {user_id, code}`,
-`POST /text` и `POST /file?name=...` (Authorization: Bearer JWT, тело — raw).
+`POST /refresh` (Bearer refresh-токен), `POST /text` и `POST /file?name=...`
+(Bearer access-токен, тело — raw). Auth и заявленный Content-Length
+проверяются **до** чтения тела запроса, одновременные загрузки ограничены —
+анонимные и сверхлимитные запросы отвергаются без буферизации.
 
 Важно: сервер получает апдейты бота через getUpdates-поллинг, поэтому на один
 токен бота — **ровно один инстанс** (второй поллер получит HTTP 409).
@@ -196,7 +207,7 @@ visend setup
 ## Разработка
 
 ```
-nodejs/       node CLI (ноль зависимостей, node >= 10)
+nodejs/       node CLI (ноль зависимостей, node >= 10.12)
 bash/         bash CLI (curl + coreutils)
 powershell/   PowerShell CLI (PS 5.1+)
 server/       TS-сервер (Express + jose), docker-образ
@@ -207,15 +218,16 @@ tests/        e2e-наборы с моком Telegram API и моком visend-�
 Запуск тестов:
 
 ```sh
-node tests/run.js         # e2e node CLI (45 проверок)
-node tests/run-bash.js    # e2e bash CLI (27 проверок; linux/MSYS)
-node tests/run-server.js  # интеграция сервера (23 проверки; сначала собрать)
-node tests/run-ps.js      # e2e powershell (21 проверка; windows)
+node tests/run.js         # e2e node CLI (50 проверок)
+node tests/run-bash.js    # e2e bash CLI (31 проверка; linux/MSYS)
+node tests/run-server.js  # интеграция сервера (35 проверок; сначала собрать)
+node tests/run-ps.js      # e2e powershell (24 проверки; windows)
 ```
 
 Релизы управляются тегами (`git tag v1.2.3 && git push --tags`): CI линтит все
-три платформы, гоняет тесты на node 10/12/16/24, собирает релизную папку
-(tarball, .deb, .apk, checksums), публикует GitHub Release, npm-пакет,
-apt+apk-репозитории на gh-pages, пакет в AUR и docker-образ.
+три платформы, гоняет тесты на node 10.12/12/16/24 плюс отдельный job на
+Windows PowerShell 5.1, собирает релизную папку (tarball, .deb, .apk,
+checksums), публикует GitHub Release, npm-пакет, apt+apk-репозитории на
+gh-pages (pool хранит старые версии для отката), пакет в AUR и docker-образ.
 
 Лицензия MIT — см. [LICENSE](LICENSE). English docs: [README.md](README.md).

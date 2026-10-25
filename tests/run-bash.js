@@ -197,6 +197,40 @@ async function main() {
   r = await runBash(['server', 'reset']);
   ok('confirm no tty -> error', r.code === 1 && /interactive terminal/.test(r.err), r.err);
 
+  // --- refresh flow ---
+  process.stdout.write('\n== refresh flow ==\n');
+  await httpGetJson(SRV.url + '/__reset');
+  writeConfig({
+    mode: 'server', user_id: 4242,
+    server_token: 'expired-access-token', server_refresh_token: SRV.refresh,
+    server_url: SRV.url,
+  });
+  await httpGetJson(SRV.url + '/__expire?token=expired-access-token');
+  r = await runBash([], { stdin: 'after refresh bash\n' });
+  let bashCfg = null;
+  try { bashCfg = JSON.parse(fs.readFileSync(path.join(SANDBOX, '.config', 'visend', 'config.json'), 'utf8')); } catch (e) { /* - */ }
+  srvSent = await httpGetJson(SRV.url + '/__sent');
+  ok('401 -> auto-refresh -> retry -> persist',
+    r.code === 0 && srvSent.texts.length === 1 && srvSent.texts[0] === 'after refresh bash\n' &&
+    bashCfg && bashCfg.server_token && bashCfg.server_token !== 'expired-access-token' &&
+    bashCfg.server_refresh_token === SRV.refresh,
+    r.out + r.err);
+
+  writeConfig({
+    mode: 'server', user_id: 4242,
+    server_token: 'expired-access-2', server_refresh_token: 'bad-refresh',
+    server_url: SRV.url,
+  });
+  await httpGetJson(SRV.url + '/__expire?token=expired-access-2');
+  r = await runBash(['text'], { stdin: 'x' });
+  ok('bad refresh -> re-setup hint', r.code === 1 && /visend setup/.test(r.err), r.err);
+
+  // --- bash 3.2 compatibility (macOS ships bash 3.2) ---
+  process.stdout.write('\n== bash 3.2 compatibility ==\n');
+  const src = fs.readFileSync(SCRIPT, 'utf8');
+  ok('no negative-offset substring expansion (needs 4.2+)', !/\$\{[A-Za-z_][A-Za-z0-9_]*:[ \t]+-/.test(src));
+  ok('no ${var,,}/${var^^} case expansion (needs 4.0+)', !/\$\{[A-Za-z_][A-Za-z0-9_]*[,^]{2}/.test(src));
+
   process.stdout.write('\n================================\n');
   process.stdout.write('bash: passed: ' + passed + ', failed: ' + failed + '\n');
   TG.server.close();

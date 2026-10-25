@@ -28,6 +28,9 @@ async function main() {
   } else {
     console.log('[startup] allow list: disabled (any Telegram user may pair)');
   }
+  console.log(
+    `[startup] tokens: access ${config.accessTokenTtl}, refresh ${config.refreshTokenTtl} (rotating)`
+  );
 
   try {
     await setMyCommands();

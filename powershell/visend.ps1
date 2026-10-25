@@ -68,7 +68,7 @@ function Save-Config([hashtable]$Cfg) {
     } catch { }
 
     $clean = @{}
-    foreach ($k in @('mode', 'bot_token', 'user_id', 'server_url', 'server_token')) {
+    foreach ($k in @('mode', 'bot_token', 'user_id', 'server_url', 'server_token', 'server_refresh_token')) {
         if ($Cfg.ContainsKey($k) -and $null -ne $Cfg[$k] -and "$($Cfg[$k])" -ne '') { $clean[$k] = $Cfg[$k] }
     }
     if ($clean.Count -eq 0) {
@@ -91,7 +91,7 @@ function Get-EffectiveServerUrl([hashtable]$Cfg) {
 function Require-Setup([hashtable]$Cfg) {
     if ($Cfg['mode'] -eq 'bot' -and $Cfg['bot_token'] -and $Cfg['user_id']) { return }
     if ($Cfg['mode'] -eq 'server' -and $Cfg['user_id']) {
-        if (-not $Cfg['server_token']) {
+        if (-not $Cfg['server_token'] -and -not $Cfg['server_refresh_token']) {
             Die "The server token is missing (the server URL was changed after setup). Run 'visend setup' again to get a new one-time code."
         }
         return
@@ -206,21 +206,51 @@ function Send-TelegramFile([string]$Token, [long]$ChatId, [byte[]]$Bytes, [strin
     }
 }
 
-function Invoke-ServerRequest([string]$Url, [string]$Method, [hashtable]$Headers, [byte[]]$BodyBytes, [string]$ContentType) {
+function Invoke-ServerSendSafe([string]$Url, [string]$Method, [hashtable]$Headers, [byte[]]$BodyBytes, [string]$ContentType) {
+    # Never dies: @{ ok=$true; json } | @{ ok=$false; error; status; maxFileSize; message }
     $irm = @{ Uri = $Url; Method = $Method; TimeoutSec = 300; ErrorAction = 'Stop' }
     if ($Headers) { $irm.Headers = $Headers }
     if ($BodyBytes) { $irm.Body = $BodyBytes }
     if ($ContentType) { $irm.ContentType = $ContentType }
     try {
-        return Invoke-RestMethod @irm
+        return @{ ok = $true; json = (Invoke-RestMethod @irm) }
     } catch {
         $info = Get-HttpErrorDescription $_
-        if ($info.error -eq 'file_too_large' -and $info.maxFileSize) {
-            $mb = [math]::Round($info.maxFileSize / 1MB, 1)
-            Die "The server rejected the file: its own size limit is $mb MB (this is a server-side limit, not the Telegram one)."
+        return @{
+            ok          = $false
+            error       = $info.error
+            message     = $info.message
+            maxFileSize = $info.maxFileSize
         }
-        Die "Request to server failed: $($info.message)"
     }
+}
+
+function Invoke-ServerRequest([string]$Url, [string]$Method, [hashtable]$Headers, [byte[]]$BodyBytes, [string]$ContentType) {
+    $r = Invoke-ServerSendSafe $Url $Method $Headers $BodyBytes $ContentType
+    if ($r.ok) { return $r.json }
+    if ($r.error -eq 'file_too_large' -and $r.maxFileSize) {
+        $mb = [math]::Round($r.maxFileSize / 1MB, 1)
+        Die "The server rejected the file: its own size limit is $mb MB (this is a server-side limit, not the Telegram one)."
+    }
+    Die "Request to server failed: $($r.message)"
+}
+
+function Invoke-ServerRefresh([hashtable]$Cfg) {
+    # Exchange the stored refresh token for a new pair; persists it. $Cfg is
+    # updated in place.
+    if (-not $Cfg['server_refresh_token']) { return $false }
+    $url = (Get-EffectiveServerUrl $Cfg).TrimEnd('/') + '/refresh'
+    $r = Invoke-ServerSendSafe $url 'Post' @{ Authorization = "Bearer $($Cfg['server_refresh_token'])" } $null $null
+    if (-not $r.ok -or -not $r.json.token) { return $false }
+    $Cfg['server_token'] = "$($r.json.token)"
+    $Cfg['server_refresh_token'] = "$($r.json.refresh_token)"
+    Save-Config $Cfg
+    return $true
+}
+
+function Test-Is401($SendResult) {
+    return (-not $SendResult.ok) -and
+        ($SendResult.error -eq 'token_expired' -or $SendResult.error -eq 'unauthorized')
 }
 
 # --------------------------------------------------------------- content ---
@@ -257,9 +287,14 @@ function Get-Preview([byte[]]$Bytes) {
 }
 
 function Get-StdinText {
-    # Pipeline input is captured at script level into $script:StdinText before
-    # Main runs ($input is not visible inside functions).
-    return $script:StdinText
+    # Redirected stdin, decoded as UTF-8 (for text use). $null when not piped.
+    if ($null -eq $script:StdinBytes) { return $null }
+    return [Text.Encoding]::UTF8.GetString($script:StdinBytes)
+}
+
+function Get-StdinBytes {
+    # Raw bytes of redirected native stdin (exact content, no decoding).
+    return $script:StdinBytes
 }
 
 # ---------------------------------------------------------------- send ----
@@ -272,11 +307,21 @@ function Send-Text([hashtable]$Cfg, [string]$Text) {
         Write-Out2 "Text sent to Telegram (message_id $($r.result.message_id))."
         return
     }
-    $url = (Get-EffectiveServerUrl $Cfg) + '/text'
+    $url = (Get-EffectiveServerUrl $Cfg).TrimEnd('/') + '/text'
     $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
-    $headers = @{ Authorization = "Bearer $($Cfg['server_token'])" }
-    $r = Invoke-ServerRequest $url 'Post' $headers $bytes 'text/plain; charset=utf-8'
-    Write-Out2 "Text sent to Telegram via $(Get-EffectiveServerUrl $Cfg) (message_id $($r.message_id))."
+    $r = Invoke-ServerSendSafe $url 'Post' @{ Authorization = "Bearer $($Cfg['server_token'])" } $bytes 'text/plain; charset=utf-8'
+    if (Test-Is401 $r) {
+        # Access token expired/rejected: refresh the pair and retry once.
+        if (-not (Invoke-ServerRefresh $Cfg)) {
+            Die 'The server rejected the token (and the refresh token did not help). Run "visend setup" again.'
+        }
+        $r = Invoke-ServerSendSafe $url 'Post' @{ Authorization = "Bearer $($Cfg['server_token'])" } $bytes 'text/plain; charset=utf-8'
+        if (Test-Is401 $r) {
+            Die 'The server rejected the token (and the refresh token did not help). Run "visend setup" again.'
+        }
+    }
+    if (-not $r.ok) { Die "Sending text failed: $($r.message)" }
+    Write-Out2 "Text sent to Telegram via $(Get-EffectiveServerUrl $Cfg) (message_id $($r.json.message_id))."
 }
 
 function Send-File([hashtable]$Cfg, [byte[]]$Bytes, [string]$Name) {
@@ -291,9 +336,24 @@ function Send-File([hashtable]$Cfg, [byte[]]$Bytes, [string]$Name) {
         Write-Out2 "File `"$Name`" ($mb MB) sent to Telegram."
         return
     }
-    $url = (Get-EffectiveServerUrl $Cfg) + '/file?name=' + [Uri]::EscapeDataString($Name)
-    $headers = @{ Authorization = "Bearer $($Cfg['server_token'])" }
-    $null = Invoke-ServerRequest $url 'Post' $headers $Bytes 'application/octet-stream'
+    $url = (Get-EffectiveServerUrl $Cfg).TrimEnd('/') + '/file?name=' + [Uri]::EscapeDataString($Name)
+    $r = Invoke-ServerSendSafe $url 'Post' @{ Authorization = "Bearer $($Cfg['server_token'])" } $Bytes 'application/octet-stream'
+    if (Test-Is401 $r) {
+        if (-not (Invoke-ServerRefresh $Cfg)) {
+            Die 'The server rejected the token (and the refresh token did not help). Run "visend setup" again.'
+        }
+        $r = Invoke-ServerSendSafe $url 'Post' @{ Authorization = "Bearer $($Cfg['server_token'])" } $Bytes 'application/octet-stream'
+        if (Test-Is401 $r) {
+            Die 'The server rejected the token (and the refresh token did not help). Run "visend setup" again.'
+        }
+    }
+    if (-not $r.ok) {
+        if ($r.error -eq 'file_too_large' -and $r.maxFileSize) {
+            $mb = [math]::Round($r.maxFileSize / 1MB, 1)
+            Die "The server rejected the file: its own size limit is $mb MB (this is a server-side limit, not the Telegram one)."
+        }
+        Die "Sending file failed: $($r.message)"
+    }
     $mb = [math]::Round($Bytes.Length / 1MB, 1)
     Write-Out2 "File `"$Name`" ($mb MB) sent to Telegram via $(Get-EffectiveServerUrl $Cfg)."
 }
@@ -345,23 +405,35 @@ function Cmd-Text([string[]]$Positional) {
     $textArg = ($Positional -join ' ')
     $cfg = Load-Config
     $stdinText = Get-StdinText
-    $hasStdin = $null -ne $stdinText
+    $stdinBytes = Get-StdinBytes
+    $hasStdin = ($null -ne $stdinText) -or ($null -ne $stdinBytes)
 
     if ($textArg -and $hasStdin) {
         Write-Warn2 'stdin ignored - the text argument takes priority.'
     }
+    $text = $null
+    $bytes = $null
     if ($textArg) {
         $text = $textArg
+        $bytes = [Text.Encoding]::UTF8.GetBytes($text)
     } elseif ($hasStdin) {
-        if ($stdinText.Length -eq 0) {
-            Die 'Nothing to send - stdin is empty. Pipe something in (e.g. Get-Content notes.txt | visend text) or pass the text as an argument (visend text hello world).'
+        if ($null -ne $stdinBytes) {
+            # redirected native stdin: exact bytes, decoded once for text use
+            if ($stdinBytes.Length -eq 0) {
+                Die 'Nothing to send - stdin is empty. Pipe something in (e.g. Get-Content notes.txt | visend text) or pass the text as an argument (visend text hello world).'
+            }
+            $bytes = $stdinBytes
+            $text = [Text.Encoding]::UTF8.GetString($stdinBytes)
+        } else {
+            if ($stdinText.Length -eq 0) {
+                Die 'Nothing to send - stdin is empty. Pipe something in (e.g. Get-Content notes.txt | visend text) or pass the text as an argument (visend text hello world).'
+            }
+            $text = $stdinText
+            $bytes = [Text.Encoding]::UTF8.GetBytes($text)
         }
-        $text = $stdinText
     } else {
         Die 'Nothing to send. Pipe something in (e.g. Get-Content notes.txt | visend text) or pass the text as an argument (visend text hello world).'
     }
-
-    $bytes = [Text.Encoding]::UTF8.GetBytes($text)
     $reason = ''
     $isBinary = Test-Binary $bytes ([ref]$reason)
     if ($isBinary) {
@@ -393,7 +465,8 @@ function Cmd-File([string[]]$Positional) {
     $cfg = Load-Config
     $pathArg = $Positional | Where-Object { $_ } | Select-Object -First 1
     $stdinText = Get-StdinText
-    $hasStdin = $null -ne $stdinText
+    $stdinBytes = Get-StdinBytes
+    $hasStdin = ($null -ne $stdinText) -or ($null -ne $stdinBytes)
 
     if ($pathArg -and $hasStdin) {
         Write-Warn2 'stdin ignored - the file path takes priority.'
@@ -407,6 +480,13 @@ function Cmd-File([string[]]$Positional) {
         }
         $bytes = [IO.File]::ReadAllBytes($pathArg)
         if (-not $name) { $name = Split-Path $pathArg -Leaf }
+    } elseif ($null -ne $stdinBytes) {
+        # redirected native stdin: exact bytes, binary-safe
+        if ($stdinBytes.Length -eq 0) {
+            Die 'Nothing to send - stdin is empty. Pipe something in (e.g. Get-Content report.pdf | visend file) or pass a file path (visend file report.pdf).'
+        }
+        $bytes = $stdinBytes
+        if (-not $name) { $name = 'visend.txt' }
     } elseif ($hasStdin) {
         if ($stdinText.Length -eq 0) {
             Die 'Nothing to send - stdin is empty. Pipe something in (e.g. Get-Content report.pdf | visend file) or pass a file path (visend file report.pdf).'
@@ -432,6 +512,7 @@ function Cmd-Settings {
     Write-Out2 "Server URL:    $srv$(if ($isDefault) { ' (default)' })"
     Write-Out2 "Bot token:     $(if ($cfg['bot_token']) { "$($cfg['bot_token'].ToString().Substring(0,4))...$($cfg['bot_token'].ToString().Substring($cfg['bot_token'].ToString().Length-4))" } else { 'not set' })"
     Write-Out2 "Server token:  $(if ($cfg['server_token']) { "$($cfg['server_token'].ToString().Substring(0,4))...$($cfg['server_token'].ToString().Substring($cfg['server_token'].ToString().Length-4))" } else { 'not set' })"
+    Write-Out2 "Refresh token: $(if ($cfg['server_refresh_token']) { "$($cfg['server_refresh_token'].ToString().Substring(0,4))...$($cfg['server_refresh_token'].ToString().Substring($cfg['server_refresh_token'].ToString().Length-4))" } else { 'not set' })"
 }
 
 function Cmd-Forget {
@@ -620,6 +701,7 @@ function Setup-Server([string]$ServerUrl, $SrvCfg) {
     $cfg['mode'] = 'server'
     $cfg['user_id'] = $userId
     $cfg['server_token'] = "$($resp.token)"
+    if ($resp.refresh_token) { $cfg['server_refresh_token'] = "$($resp.refresh_token)" } else { $cfg.Remove('server_refresh_token') }
     $cfg.Remove('bot_token')
     Save-Config $cfg
     Write-Out2 'Paired with the server.'
@@ -746,20 +828,23 @@ function Setup-Bot {
 
 # ----------------------------------------------------------------- main ---
 
-# Capture piped input before entering functions. $input only exists at the
-# script level; redirected native stdin is read from the console stream.
-$script:StdinText = $null
+# Capture redirected native stdin BYTE-BY-BYTE (binary- and CRLF-safe).
+# NOTE: this script deliberately never references $input / ExpectingInput:
+# in PS 5.1 their mere presence makes the host eagerly consume redirected
+# stdin into a TEXT pipeline, mangling bytes and line endings before any
+# script code runs. In-session PS piping (`"x" | visend.ps1`) is therefore
+# not supported - pipe from programs (`type f | visend.ps1 text`) or pass
+# text as arguments instead.
+$script:StdinBytes = $null
 try {
-    if ($MyInvocation.ExpectingInput) {
-        $lines = @()
-        foreach ($item in @($input)) { $lines += "$item" }
-        if ($lines.Count -gt 0) { $script:StdinText = ($lines -join "`n") }
-        elseif ([Console]::IsInputRedirected) { $script:StdinText = '' }
-    } elseif ([Console]::IsInputRedirected) {
-        $reader = New-Object IO.StreamReader([Console]::OpenStandardInput(), [Text.Encoding]::UTF8)
-        $lines = @()
-        while ($null -ne ($line = $reader.ReadLine())) { $lines += $line }
-        $script:StdinText = ($lines -join "`n")
+    if ([Console]::IsInputRedirected) {
+        $stream = [Console]::OpenStandardInput()
+        $buffer = New-Object byte[] 65536
+        $collected = New-Object System.Collections.Generic.List[byte]
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            for ($i = 0; $i -lt $read; $i++) { $collected.Add($buffer[$i]) }
+        }
+        $script:StdinBytes = $collected.ToArray()
     }
 } catch { }
 
@@ -788,8 +873,8 @@ function Main {
     if ($positionals.Count -gt 1) { $rest = $positionals[1..($positionals.Count - 1)] }
 
     if (-not $cmd) {
-        $stdinText = Get-StdinText
-        if ($null -ne $stdinText) { $cmd = 'text' } else { Cmd-Help; exit 0 }
+        $hasPiped = ($null -ne (Get-StdinText)) -or ($null -ne (Get-StdinBytes))
+        if ($hasPiped) { $cmd = 'text' } else { Cmd-Help; exit 0 }
     }
 
     switch ($cmd) {

@@ -5,20 +5,37 @@
 // Endpoints mirror the real server contract:
 //   GET  /status   {ok, uptime_seconds}
 //   GET  /config   {ok, max_file_size, bot}
-//   POST /connect  {user_id, code} -> {ok, token}; code must be TESTCODE
-//   POST /text     Bearer <token>, raw utf-8 body
-//   POST /file?name=...  Bearer <token>, raw bytes
-// Admin: /__sent, /__reset, /__setlimit?bytes=, /__offline=1|0
+//   POST /connect  {user_id, code} -> {ok, token, refresh_token}; code must be TESTCODE
+//   POST /refresh  Bearer <refresh token> -> {ok, token, refresh_token} (rotating access)
+//   POST /text     Bearer <access token>, raw utf-8 body
+//   POST /file?name=...  Bearer <access token>, raw bytes
+// Admin: /__sent, /__reset, /__setlimit?bytes=, /__offline=1|0, /__expire?token=
 
 const http = require('http');
+const crypto = require('crypto');
 
 function createMockServer(port) {
   const VALID_CODE = 'TESTCODE';
+  const VALID_REFRESH = 'srv-test-refresh';
   const VALID_TOKEN = 'srv-test-token';
   let limitBytes = 50 * 1024 * 1024;
   let offline = false;
   let failedAttempts = {};
-  const sent = { texts: [], files: [], connects: 0 };
+  let freshCounter = 0;
+  const issued = new Set([VALID_TOKEN]);
+  const expired = new Set();
+  const sent = { texts: [], files: [], connects: 0, refreshes: 0 };
+
+  function authCheck(req) {
+    const auth = req.headers['authorization'] || '';
+    const m = /^Bearer\s+(.+)$/i.exec(auth);
+    if (!m) return 'unauthorized';
+    const token = m[1];
+    if (expired.has(token)) return 'token_expired';
+    if (token === VALID_REFRESH) return 'unauthorized'; // refresh in place of access
+    if (!issued.has(token)) return 'unauthorized';
+    return 'ok';
+  }
 
   const server = http.createServer(function (req, res) {
     const u = new URL(req.url, 'http://localhost');
@@ -38,13 +55,19 @@ function createMockServer(port) {
           limitBytes = 50 * 1024 * 1024;
           offline = false;
           failedAttempts = {};
+          issued.clear();
+          issued.add(VALID_TOKEN);
+          expired.clear();
+          freshCounter = 0;
           sent.texts = [];
           sent.files = [];
           sent.connects = 0;
+          sent.refreshes = 0;
           return json({ ok: true });
         }
         if (p === '/__setlimit') { limitBytes = Number(u.searchParams.get('bytes')); return json({ ok: true }); }
         if (p === '/__offline') { offline = u.searchParams.get('v') === '1'; return json({ ok: true }); }
+        if (p === '/__expire') { expired.add(u.searchParams.get('token')); return json({ ok: true }); }
         return json({ ok: false }, 404);
       }
       if (offline) return json({ ok: false, description: 'offline' }, 503);
@@ -65,11 +88,22 @@ function createMockServer(port) {
           }
           return json({ ok: false, error: 'invalid_code', description: 'wrong code' }, 403);
         }
-        return json({ ok: true, token: VALID_TOKEN });
+        return json({ ok: true, token: VALID_TOKEN, refresh_token: VALID_REFRESH });
       }
-      const auth = req.headers['authorization'] || '';
-      if (auth !== 'Bearer ' + VALID_TOKEN) {
-        return json({ ok: false, error: 'unauthorized', description: 'bad token' }, 401);
+      if (p === '/refresh' && req.method === 'POST') {
+        sent.refreshes++;
+        const auth = req.headers['authorization'] || '';
+        if (auth !== 'Bearer ' + VALID_REFRESH) {
+          return json({ ok: false, error: 'unauthorized', description: 'bad refresh token' }, 401);
+        }
+        freshCounter++;
+        const fresh = 'srv-test-token-fresh-' + freshCounter;
+        issued.add(fresh);
+        return json({ ok: true, token: fresh, refresh_token: VALID_REFRESH });
+      }
+      const verdict = authCheck(req);
+      if (verdict !== 'ok') {
+        return json({ ok: false, error: verdict, description: verdict === 'token_expired' ? 'access token expired' : 'bad token' }, 401);
       }
       if (p === '/text' && req.method === 'POST') {
         if (!body.length) return json({ ok: false, error: 'empty_text' }, 400);
@@ -80,7 +114,11 @@ function createMockServer(port) {
         if (body.length > limitBytes) {
           return json({ ok: false, error: 'file_too_large', description: 'too big', max_file_size: limitBytes }, 413);
         }
-        sent.files.push({ name: u.searchParams.get('name'), size: body.length });
+        sent.files.push({
+          name: u.searchParams.get('name'),
+          size: body.length,
+          sha256: crypto.createHash('sha256').update(body).digest('hex'),
+        });
         return json({ ok: true, message_id: 12 });
       }
       return json({ ok: false, description: 'Not found' }, 404);
@@ -95,6 +133,7 @@ function createMockServer(port) {
         url: 'http://127.0.0.1:' + server.address().port,
         code: VALID_CODE,
         token: VALID_TOKEN,
+        refresh: VALID_REFRESH,
       });
     });
   });

@@ -11,10 +11,12 @@
   },
   "files": [
     "bin",
-    "lib"
+    "lib",
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
-    "node": ">=10"
+    "node": ">=10.12"
   },
   "license": "MIT",
   "repository": {

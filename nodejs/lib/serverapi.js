@@ -11,7 +11,6 @@ class ServerError extends Error {
     this.maxFileSize = maxFileSize;
   }
 }
-
 function checkResponse(res, what) {
   let json = null;
   try {
@@ -49,6 +48,16 @@ async function connect(serverUrl, userId, code) {
   return checkResponse(res, 'Server connect');
 }
 
+// Exchange a refresh token for a new access+refresh pair.
+async function refresh(serverUrl, refreshToken) {
+  const res = await httpx.request(serverUrl.replace(/\/+$/, '') + '/refresh', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + refreshToken },
+    timeoutMs: 20000,
+  });
+  return checkResponse(res, 'Token refresh');
+}
+
 async function sendText(serverUrl, token, textBuf) {
   const res = await httpx.request(serverUrl.replace(/\/+$/, '') + '/text', {
     method: 'POST',
@@ -83,6 +92,7 @@ module.exports = {
   fetchStatus: fetchStatus,
   fetchConfig: fetchConfig,
   connect: connect,
+  refresh: refresh,
   sendText: sendText,
   sendFile: sendFile,
 };

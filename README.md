@@ -66,18 +66,20 @@ yay -S visend        # or any AUR helper
 
 ### Windows
 
-- **scoop** (uses the portable exe zip; no node required):
+Today, three ways work:
 
-  ```powershell
-  scoop bucket add vishota https://github.com/vishota/scoop-bucket
-  scoop install visend
-  ```
+- **npm** (with node installed): `npm i -g visend` or `npx visend`.
+- **PowerShell script** (no node needed): download
+  [powershell/visend.ps1](powershell/visend.ps1), run
+  `visend.ps1 text "hello"`; native pipes (`type file.log | visend.ps1 file`)
+  are binary-safe. Note: piping from *inside* a PowerShell session
+  (`"x" | visend.ps1`) is not supported - pass text as arguments or pipe from
+  programs.
+- **Git Bash / WSL**: use the bash version or npm.
 
-- **winget** — in progress (phase 2; PR to `microsoft/winget-pkgs`).
-- Manual: grab `visend-<version>-win-x64.zip` from the
-  [releases](https://github.com/vishota/visend/releases) page, unpack, add to
-  `PATH`.
-- With PowerShell and no exe: `powershell/visend.ps1` from this repo works as-is.
+Planned (phase 2, not yet available): a portable exe zip, scoop and winget
+channels. The manifest templates live in `packaging/`; until the bundling
+job exists there is no `visend-<version>-win-x64.zip` to download.
 
 ## Setup
 
@@ -146,9 +148,11 @@ URL.
 - **Own bot mode** talks to the Telegram Bot API directly; the token is stored
   only on your machine.
 - **Server mode** pairs once with a one-time code (issued by the bot on
-  `/start`, valid 1 h, 5 wrong attempts burn it) and receives a JWT signed
-  with the server's secret. The server stores no tokens: rotate `SERVER_SECRET`
-  to revoke everything.
+  `/start`, valid 1 h, 5 wrong attempts burn it) and receives a **token pair**:
+  a 24 h access token and a rotating 180-day refresh token (JWT, HS256, only
+  user_id + type inside). When the access token expires, the CLI refreshes the
+  pair automatically, persists it and retries - you never notice. The server
+  stores no tokens: rotate `SERVER_SECRET` to revoke everything.
 
 ## Self-hosting the server
 
@@ -184,12 +188,19 @@ Configuration:
 |---|---|---|
 | Bot token | docker secret `telegram_bot_token` / env `TELEGRAM_BOT_TOKEN` | required |
 | Token signing secret | docker secret `server_secret` / env `SERVER_SECRET` | required; same secret = tokens survive restarts; rotate to revoke all |
-| User allow list | env `ALLOWED_USER_IDS=123,456` | optional; restricts who may pair |
-| Max file size | env `MAX_FILE_SIZE` (bytes, default 50 MB) | optional |
+| User allow list | env `ALLOWED_USER_IDS=123,456` | optional; restricts who may pair; garbage in the value refuses to start (fail-closed) |
+| Max file size | env `MAX_FILE_SIZE` (bytes, default 50 MB) | optional; also the early Content-Length gate |
+| Max concurrent uploads | env `MAX_CONCURRENT_UPLOADS` (default 8) | memory bound: auth + declared size are checked before the body is read |
+| Access token TTL | env `ACCESS_TOKEN_TTL` (default `24h`) | expired access -> 401 `token_expired`; clients auto-refresh |
+| Refresh token TTL | env `REFRESH_TOKEN_TTL` (default `180d`) | refresh rotates on every use |
+| Trust reverse proxy | env `TRUST_PROXY=1` | only then X-Forwarded-For is used for rate limiting |
 | Port | env `PORT` (default 8080) | |
 
 Endpoints: `GET /status`, `GET /config`, `POST /connect {user_id, code}`,
-`POST /text` and `POST /file?name=...` (Authorization: Bearer JWT, raw body).
+`POST /refresh` (Bearer refresh token), `POST /text` and `POST /file?name=...`
+(Bearer access token, raw body). Auth and the declared Content-Length are
+verified **before** the request body is read, and concurrent uploads are
+capped - anonymous or oversized requests are rejected without buffering.
 
 Note: the server consumes bot updates via getUpdates polling, so **exactly one
 instance** may run per bot token (a second poller gets HTTP 409 from Telegram).
@@ -197,7 +208,7 @@ instance** may run per bot token (a second poller gets HTTP 409 from Telegram).
 ## Development
 
 ```
-nodejs/       node CLI (zero dependencies, node >= 10)
+nodejs/       node CLI (zero dependencies, node >= 10.12)
 bash/         bash CLI (curl + coreutils)
 powershell/   PowerShell CLI (PS 5.1+)
 server/       TS server (Express + jose), docker image
@@ -208,15 +219,17 @@ tests/        e2e suites with a mock Telegram API and a mock visend server
 Run the test suites:
 
 ```sh
-node tests/run.js         # node CLI e2e (45 checks)
-node tests/run-bash.js    # bash CLI e2e (27 checks; linux/MSYS)
-node tests/run-server.js  # server integration (23 checks; build server first)
-node tests/run-ps.js      # powershell e2e (21 checks; windows)
+node tests/run.js         # node CLI e2e (50 checks)
+node tests/run-bash.js    # bash CLI e2e (31 checks; linux/MSYS)
+node tests/run-server.js  # server integration (35 checks; build server first)
+node tests/run-ps.js      # powershell e2e (24 checks; windows)
 ```
 
 Releases are tag-driven (`git tag v1.2.3 && git push --tags`): CI lints all
-three platforms, runs the suites on node 10/12/16/24, builds the release
-directory (tarball, .deb, .apk, checksums), publishes the GitHub Release, npm
-package, apt+apk repositories on gh-pages, AUR package and the docker image.
+three platforms, runs the suites on node 10.12/12/16/24 plus a Windows
+PowerShell 5.1 job, builds the release directory (tarball, .deb, .apk,
+checksums), publishes the GitHub Release, npm package, apt+apk repositories on
+gh-pages (pool keeps old versions for rollback), AUR package and the docker
+image.
 
 MIT License — see [LICENSE](LICENSE). [README.RU.md](README.RU.md) — документация на русском.

@@ -10,7 +10,7 @@ const { VisendError } = require('./errors');
 const DEFAULT_SERVER_URL = 'https://visend.vishota.com';
 
 // Keys of config.json. Shared with the bash and powershell implementations.
-const KEYS = ['mode', 'bot_token', 'user_id', 'server_url', 'server_token'];
+const KEYS = ['mode', 'bot_token', 'user_id', 'server_url', 'server_token', 'server_refresh_token'];
 
 function configDir() {
   return path.join(os.homedir(), '.config', 'visend');

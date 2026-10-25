@@ -25,6 +25,7 @@ function createMockTg(port) {
   let getUpdatesInFlight = 0;
   let pendingPush = null; // {after, payload}
   let conflictNext = 0; // number of getUpdates calls that answer 409
+  let holdSendMs = 0; // delay sendDocument responses (concurrency tests)
   const sent = { messages: [], documents: [], webhook_deleted: 0 };
 
   function maybeDelayedPush() {
@@ -72,9 +73,11 @@ function createMockTg(port) {
         sent.documents = [];
         sent.webhook_deleted = 0;
         conflictNext = 0;
+        holdSendMs = 0;
         return json({ ok: true });
       }
       if (p === '/__409') { conflictNext = Number(u.searchParams.get('n') || '1'); return json({ ok: true }); }
+      if (p === '/__holdsend') { holdSendMs = Number(u.searchParams.get('ms') || '0'); return json({ ok: true }); }
       return json({ ok: false }, 404);
     }
 
@@ -144,6 +147,8 @@ function createMockTg(port) {
             size: body.length,
             chat_id: (/name="chat_id"\r\n\r\n(\d+)/.exec(body) || /name=chat_id\r\n\r\n(\d+)/.exec(body) || [])[1],
           });
+          setTimeout(function () { json({ ok: true, result: { message_id: 777 } }); }, holdSendMs);
+          return;
         }
         json({ ok: true, result: { message_id: 777 } });
       });

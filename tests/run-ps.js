@@ -177,6 +177,46 @@ async function main() {
   cfg2 = JSON.parse(fs.readFileSync(path.join(SANDBOX, '.config', 'visend', 'config.json'), 'utf8'));
   ok('server reset', r.code === 0 && !cfg2.server_url, r.out + r.err);
 
+  // --- binary stdin must survive byte-exact (raw copy, no line decoding) ---
+  process.stdout.write('\n== raw stdin ==\n');
+  const crypto = require('crypto');
+  const bin = Buffer.from([0x00, 0x01, 0x02, 0x0d, 0x0a, 0xff, 0xfe, 0x41]);
+  await httpGetJson(SRV.url + '/__reset');
+  writeConfig({ mode: 'server', user_id: 4242, server_token: SRV.token, server_url: SRV.url });
+  r = await runPs(['file', '--name', 'raw.bin', '-y'], { stdin: bin });
+  srvSent = await httpGetJson(SRV.url + '/__sent');
+  const binSha = crypto.createHash('sha256').update(bin).digest('hex');
+  ok('binary stdin preserved byte-exact (CRLF and 0xFF intact)',
+    r.code === 0 && srvSent.files.length === 1 && srvSent.files[0].sha256 === binSha,
+    r.out + r.err + JSON.stringify(srvSent.files));
+
+  // text via native stdin keeps its CRLF as-is
+  await httpGetJson(SRV.url + '/__reset');
+  r = await runPs([], { stdin: 'line1\r\nline2\r\n' });
+  srvSent = await httpGetJson(SRV.url + '/__sent');
+  ok('CRLF in native stdin is not mangled',
+    r.code === 0 && srvSent.texts.length === 1 && srvSent.texts[0] === 'line1\r\nline2\r\n',
+    JSON.stringify(srvSent.texts) + r.out + r.err);
+
+  // --- refresh flow ---
+  process.stdout.write('\n== refresh flow ==\n');
+  await httpGetJson(SRV.url + '/__reset');
+  writeConfig({
+    mode: 'server', user_id: 4242,
+    server_token: 'expired-access-token', server_refresh_token: SRV.refresh,
+    server_url: SRV.url,
+  });
+  await httpGetJson(SRV.url + '/__expire?token=expired-access-token');
+  r = await runPs([], { stdin: 'after refresh ps\r\n' });
+  let psCfg = null;
+  try { psCfg = JSON.parse(fs.readFileSync(path.join(SANDBOX, '.config', 'visend', 'config.json'), 'utf8')); } catch (e) { /* - */ }
+  srvSent = await httpGetJson(SRV.url + '/__sent');
+  ok('401 -> auto-refresh -> retry -> persist',
+    r.code === 0 && srvSent.texts.length === 1 &&
+    psCfg && psCfg.server_token && psCfg.server_token !== 'expired-access-token' &&
+    psCfg.server_refresh_token === SRV.refresh,
+    r.out + r.err);
+
   process.stdout.write('\n================================\n');
   process.stdout.write('powershell: passed: ' + passed + ', failed: ' + failed + '\n');
   TG.server.close();

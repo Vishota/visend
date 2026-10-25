@@ -20,6 +20,7 @@ async function run() {
     (cfg.server_url ? '' : ' (default)') + '\n');
   out.write('Bot token:     ' + mask(cfg.bot_token) + '\n');
   out.write('Server token:  ' + mask(cfg.server_token) + '\n');
+  out.write('Refresh token: ' + mask(cfg.server_refresh_token) + '\n');
 }
 
 module.exports = { run: run };

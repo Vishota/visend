@@ -68,9 +68,11 @@ async function setupServer(serverUrl, statusInfo, cfgInfo) {
   const code = (await tty.askRequired('One-time code: ')).toUpperCase();
   out('Connecting to ' + serverUrl + ' ...');
   let token;
+  let refreshToken;
   try {
     const result = await serverapi.connect(serverUrl, userId, code);
     token = result.token;
+    refreshToken = result.refresh_token || '';
   } catch (err) {
     if (err instanceof serverapi.ServerError) {
       if (err.status === 429) throw new VisendError('The server rate-limited you. Wait a minute and try again.');
@@ -85,6 +87,8 @@ async function setupServer(serverUrl, statusInfo, cfgInfo) {
   cfg.mode = 'server';
   cfg.user_id = userId;
   cfg.server_token = token;
+  if (refreshToken) cfg.server_refresh_token = refreshToken;
+  else delete cfg.server_refresh_token;
   config.save(cfg);
   out('Paired with the server.');
   // Confirm end-to-end delivery.

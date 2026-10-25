@@ -81,14 +81,23 @@ BOT_TOKEN="$(config_get bot_token)"
 USER_ID="$(config_get_number user_id)"
 SERVER_URL="$(config_get server_url)"
 SERVER_TOKEN="$(config_get server_token)"
+SERVER_REFRESH_TOKEN="$(config_get server_refresh_token)"
 SERVER_URL="${SERVER_URL:-$DEFAULT_SERVER_URL}"
+
+# Last 4 chars without negative offsets (bash 3.2 on macOS compatibility).
+tail4() {
+  local s="$1"
+  printf '%s' "$s" | tail -c 4
+}
 
 save_config() {
   # Rebuilds the whole file from MODE/BOT_TOKEN/USER_ID/SERVER_URL/SERVER_TOKEN.
   mkdir -p "$CONFIG_DIR" 2>/dev/null || die "cannot create $CONFIG_DIR"
   chmod 700 "$CONFIG_DIR" 2>/dev/null
+  # Temp file in the SAME directory: mv across filesystems (e.g. TMPDIR on
+  # another device) is copy+unlink and not atomic.
   local tmp entries=0
-  tmp=$(new_tmp)
+  tmp="$CONFIG_DIR/.config.$$"
   {
     printf '{'
     if [ -n "$MODE" ]; then
@@ -110,6 +119,10 @@ save_config() {
       [ $entries -eq 1 ] && printf ','
       printf '\n  "server_token": "%s"' "$(json_escape "$SERVER_TOKEN")"; entries=1
     fi
+    if [ -n "$SERVER_REFRESH_TOKEN" ]; then
+      [ $entries -eq 1 ] && printf ','
+      printf '\n  "server_refresh_token": "%s"' "$(json_escape "$SERVER_REFRESH_TOKEN")"; entries=1
+    fi
     if [ $entries -eq 1 ]; then printf '\n'; fi
     printf '}\n'
   } > "$tmp"
@@ -120,7 +133,7 @@ save_config() {
 require_setup() {
   if [ "$MODE" = "bot" ] && [ -n "$BOT_TOKEN" ] && [ -n "$USER_ID" ]; then return 0; fi
   if [ "$MODE" = "server" ] && [ -n "$USER_ID" ]; then
-    if [ -z "$SERVER_TOKEN" ]; then
+    if [ -z "$SERVER_TOKEN" ] && [ -z "$SERVER_REFRESH_TOKEN" ]; then
       die "The server token is missing (the server URL was changed after setup). Run \`visend setup\` again to get a new one-time code."
     fi
     return 0
@@ -206,9 +219,12 @@ native_path() {
 }
 
 tg_call() {
-  # tg_call METHOD [curl-data-args...]
-  local method="$1"; shift
-  curl -sS -m 60 -X POST "$TG_API/bot$BOT_TOKEN/$method" "$@"
+  # tg_call TIMEOUT METHOD [curl-data-args...]
+  # The URL carries the bot token, so it goes through a curl config on stdin
+  # (-K -) instead of argv: argv is visible to every user via ps.
+  local tmo="$1" method="$2"; shift 2
+  printf 'url = "%s/bot%s/%s"\nrequest = "POST"\n' "$TG_API" "$BOT_TOKEN" "$method" |
+    curl -sS -m "$tmo" -K - "$@"
 }
 
 tg_ok() {
@@ -231,7 +247,7 @@ send_text_bot() {
   # $1 = file with the text
   local resp desc np
   np=$(native_path "$1")
-  resp=$(tg_call sendMessage \
+  resp=$(tg_call 60 sendMessage \
     --data-urlencode "chat_id=$USER_ID" \
     --data-urlencode "text@$np") || die "Telegram API request failed (network error)."
   if tg_ok "$resp"; then
@@ -245,9 +261,10 @@ send_text_bot() {
 
 send_file_bot() {
   # $1 = file path, $2 = display name, $3 = size (for messages)
+  # 300s: a 50 MB upload on a slow uplink needs way more than a minute.
   local resp desc np
   np=$(native_path "$1")
-  resp=$(tg_call sendDocument \
+  resp=$(tg_call 300 sendDocument \
     -F "chat_id=$USER_ID" \
     -F "document=@$np;filename=$2") || die "Telegram API request failed (network error)."
   if tg_ok "$resp"; then
@@ -259,30 +276,79 @@ send_file_bot() {
   fi
 }
 
+# --- server requests: bearer token stays out of argv, 401 -> refresh+retry ---
+
+server_text_once() {
+  # $1 = file with the text; stdout = raw response
+  local np
+  np=$(native_path "$1")
+  printf 'url = "%s/text"\nrequest = "POST"\nheader = "Authorization: Bearer %s"\n' \
+    "$SERVER_URL" "$SERVER_TOKEN" |
+    curl -sS -m 120 -K - \
+      -H "Content-Type: text/plain; charset=utf-8" \
+      --data-binary "@$np"
+}
+
+server_file_once() {
+  # $1 = file path, $2 = display name; stdout = raw response
+  local np
+  np=$(native_path "$1")
+  printf 'url = "%s/file?name=%s"\nrequest = "POST"\nheader = "Authorization: Bearer %s"\n' \
+    "$SERVER_URL" "$(urlencode "$2")" "$SERVER_TOKEN" |
+    curl -sS -m 300 -K - \
+      -H "Content-Type: application/octet-stream" \
+      --data-binary "@$np"
+}
+
+server_refresh() {
+  # Exchange the refresh token for a new pair; persists it to the config.
+  local resp
+  [ -n "$SERVER_REFRESH_TOKEN" ] || return 1
+  resp=$(printf 'url = "%s/refresh"\nrequest = "POST"\nheader = "Authorization: Bearer %s"\n' \
+    "$SERVER_URL" "$SERVER_REFRESH_TOKEN" |
+    curl -sS -m 20 -K -) || return 1
+  tg_ok "$resp" || return 1
+  SERVER_TOKEN=$(printf '%s' "$resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  SERVER_REFRESH_TOKEN=$(printf '%s' "$resp" | sed -n 's/.*"refresh_token":"\([^"]*\)".*/\1/p')
+  [ -n "$SERVER_TOKEN" ] && [ -n "$SERVER_REFRESH_TOKEN" ] || return 1
+  save_config
+  return 0
+}
+
+resp_is_401() {
+  printf '%s' "$1" | grep -Eq '"(token_expired|unauthorized)"'
+}
+
+# Runs the request function ($1, args $2..); on 401 refreshes and retries once.
+server_send_with_refresh() {
+  local fn="$1"; shift
+  local resp
+  resp=$("$fn" "$@") || resp='{"ok":false,"error":"network"}'
+  if resp_is_401 "$resp" && server_refresh; then
+    resp=$("$fn" "$@") || resp='{"ok":false,"error":"network"}'
+  fi
+  printf '%s' "$resp"
+}
+
 server_post_text() {
   # $1 = file with the text
-  local resp desc np
-  np=$(native_path "$1")
-  resp=$(curl -sS -m 120 -X POST "$SERVER_URL/text" \
-    -H "Authorization: Bearer $SERVER_TOKEN" \
-    -H "Content-Type: text/plain; charset=utf-8" \
-    --data-binary "@$np") || die "Server request failed (network error)."
+  local resp desc
+  resp=$(server_send_with_refresh server_text_once "$1") || die "Server request failed (network error)."
   if tg_ok "$resp"; then
     out "Text sent to Telegram via $SERVER_URL (message_id $(tg_message_id "$resp"))."
-  else
-    desc=$(tg_description "$resp"); [ -z "$desc" ] && desc=$(server_error "$resp")
-    die "Sending text failed: ${desc:-HTTP error}."
+    return 0
   fi
+  if resp_is_401 "$resp"; then
+    die "The server rejected the token (and the refresh token did not help). Run \`visend setup\` again."
+  fi
+  desc=$(tg_description "$resp"); [ -z "$desc" ] && desc=$(server_error "$resp")
+  die "Sending text failed: ${desc:-HTTP error}."
 }
 
 server_post_file() {
   # $1 = file path, $2 = display name, $3 = size in bytes
-  local resp desc np
-  np=$(native_path "$1")
-  resp=$(curl -sS -m 300 -X POST "$SERVER_URL/file?name=$(urlencode "$2")" \
-    -H "Authorization: Bearer $SERVER_TOKEN" \
-    -H "Content-Type: application/octet-stream" \
-    --data-binary "@$np") || die "Server request failed (network error)."
+  local resp desc
+  resp=$(server_send_with_refresh server_file_once "$1" "$2") || die "Server request failed (network error)."
   if tg_ok "$resp"; then
     out "File \"$2\" ($(size_mb "$3") MB) sent to Telegram via $SERVER_URL."
     return 0
@@ -292,8 +358,8 @@ server_post_file() {
     limit=$(printf '%s' "$resp" | sed -n 's/.*"max_file_size":\([0-9]*\).*/\1/p')
     die "The server rejected the file: its own size limit is $((limit / 1024 / 1024)) MB (this is a server-side limit, not the Telegram one)."
   fi
-  if printf '%s' "$resp" | grep -q '"unauthorized"' || printf '%s' "$resp" | grep -q '"error":"unauthorized"'; then
-    die "The server rejected the token. Run \`visend setup\` again to get a new one-time code."
+  if resp_is_401 "$resp"; then
+    die "The server rejected the token (and the refresh token did not help). Run \`visend setup\` again to get a new one-time code."
   fi
   desc=$(tg_description "$resp")
   die "Sending file failed: ${desc:-HTTP error}."
@@ -519,16 +585,22 @@ cmd_settings() {
     out "Server URL:    $SERVER_URL"
   fi
   if [ -n "$BOT_TOKEN" ]; then
-    token_preview="${BOT_TOKEN:0:4}...${BOT_TOKEN: -4}"
+    token_preview="${BOT_TOKEN:0:4}...$(tail4 "$BOT_TOKEN")"
     out "Bot token:     $token_preview"
   else
     out "Bot token:     not set"
   fi
   if [ -n "$SERVER_TOKEN" ]; then
-    token_preview="${SERVER_TOKEN:0:4}...${SERVER_TOKEN: -4}"
+    token_preview="${SERVER_TOKEN:0:4}...$(tail4 "$SERVER_TOKEN")"
     out "Server token:  $token_preview"
   else
     out "Server token:  not set"
+  fi
+  if [ -n "$SERVER_REFRESH_TOKEN" ]; then
+    token_preview="${SERVER_REFRESH_TOKEN:0:4}...$(tail4 "$SERVER_REFRESH_TOKEN")"
+    out "Refresh token: $token_preview"
+  else
+    out "Refresh token: not set"
   fi
 }
 
@@ -687,16 +759,18 @@ server_setup() {
     die "The code or user id is wrong (or the code expired). Send /start to the bot again and retry."
   fi
   token=$(printf '%s' "$resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  SERVER_REFRESH_TOKEN=$(printf '%s' "$resp" | sed -n 's/.*"refresh_token":"\([^"]*\)".*/\1/p')
   [ -n "$token" ] || die "Server reply did not contain a token."
   MODE="server"; USER_ID="$user_id"; SERVER_TOKEN="$token"; BOT_TOKEN=""
   save_config
   out "Paired with the server."
   welcome=$(new_tmp)
   printf 'visend is set up! Everything you pipe will arrive here.' > "$welcome"
-  if resp=$(curl -sS -m 60 -X POST "$SERVER_URL/text" \
-      -H "Authorization: Bearer $SERVER_TOKEN" \
-      -H "Content-Type: text/plain; charset=utf-8" \
-      --data-binary "@$(native_path "$welcome")") && tg_ok "$resp"; then
+  if resp=$(printf 'url = "%s/text"\nrequest = "POST"\nheader = "Authorization: Bearer %s"\n' \
+      "$SERVER_URL" "$SERVER_TOKEN" |
+      curl -sS -m 60 -K - \
+        -H "Content-Type: text/plain; charset=utf-8" \
+        --data-binary "@$(native_path "$welcome")") && tg_ok "$resp"; then
     out "Test message sent to your Telegram. Setup complete."
   else
     warn "pairing succeeded, but the test message failed."
