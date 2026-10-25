@@ -1,3 +1,5 @@
+*still in work currently, has not been published anywhere yet*
+
 # visend
 
 Send files and text **to yourself** via Telegram, straight from any terminal.
